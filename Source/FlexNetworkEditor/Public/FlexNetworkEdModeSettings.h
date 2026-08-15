@@ -18,6 +18,15 @@ class UFlexNetworkEdModeSettings : public UObject
 	GENERATED_BODY()
 
 public:
+	/**
+	 * When on: click once to place/continue a road's start point, move the mouse to preview,
+	 * click again to commit the segment (like the Landscape Splines "Add Control Point" tool).
+	 * When off ("Select" mode): click an existing node to select it, then drag the viewport
+	 * gizmo to move it.
+	 */
+	UPROPERTY(EditAnywhere, Category = "FlexNetwork", meta = (DisplayName = "Draw Mode (off = Select/Move)"))
+	bool bDrawModeActive = true;
+
 	/** Road type profile new segments are drawn with. */
 	UPROPERTY(EditAnywhere, Category = "FlexNetwork")
 	TObjectPtr<URoadTypeProfile> ActiveProfile;

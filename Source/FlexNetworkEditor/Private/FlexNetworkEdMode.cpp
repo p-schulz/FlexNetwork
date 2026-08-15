@@ -1,6 +1,7 @@
 #include "FlexNetworkEdMode.h"
 #include "FlexNetworkEdModeSettings.h"
 #include "FlexNetworkEdModeToolkit.h"
+#include "FlexNetworkHitProxies.h"
 #include "FlexNetworkSubsystem.h"
 #include "FlexNetworkSettings.h"
 #include "RoadTypeProfile.h"
@@ -10,6 +11,10 @@
 #include "SceneManagement.h"
 #include "ScopedTransaction.h"
 #include "Engine/World.h"
+#include "Engine/HitResult.h"
+#include "Engine/EngineTypes.h"
+#include "CollisionQueryParams.h"
+#include "EngineDefines.h"
 #include "Toolkits/ToolkitManager.h"
 #include "EditorModeManager.h"
 
@@ -26,7 +31,7 @@ FFlexNetworkEdMode::~FFlexNetworkEdMode()
 void FFlexNetworkEdMode::Enter()
 {
 	FEdMode::Enter();
-	DragState = EDragState::Idle;
+	DrawState = EDrawState::Idle;
 
 	if (!Toolkit.IsValid() && UsesToolkits())
 	{
@@ -37,7 +42,8 @@ void FFlexNetworkEdMode::Enter()
 
 void FFlexNetworkEdMode::Exit()
 {
-	CancelDrag();
+	CancelPlacement();
+	ActiveNodeMoveTransaction.Reset();
 
 	if (Toolkit.IsValid())
 	{
@@ -72,7 +78,13 @@ UFlexNetworkEdModeSettings* FFlexNetworkEdMode::GetOrCreateModeSettings() const
 	return ModeSettings;
 }
 
-bool FFlexNetworkEdMode::ComputeGroundPlanePoint(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 X, int32 Y, FVector& OutPoint) const
+bool FFlexNetworkEdMode::IsDrawModeActive() const
+{
+	const UFlexNetworkEdModeSettings* Settings = GetOrCreateModeSettings();
+	return Settings && Settings->bDrawModeActive;
+}
+
+bool FFlexNetworkEdMode::TraceCursorToWorld(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 X, int32 Y, FVector& OutPoint) const
 {
 	if (!ViewportClient || !Viewport)
 	{
@@ -87,24 +99,43 @@ bool FFlexNetworkEdMode::ComputeGroundPlanePoint(FEditorViewportClient* Viewport
 	}
 
 	const FViewportCursorLocation CursorLocation(View, ViewportClient, X, Y);
-	const FVector Origin = CursorLocation.GetOrigin();
 	const FVector Direction = CursorLocation.GetDirection();
+	FVector Start = CursorLocation.GetOrigin();
 
-	// Ground plane: while dragging, use the height of the drag's start point (so a drag begun at
-	// an elevated node stays on a plane through that node instead of snapping back to world
-	// Z=0); otherwise world Z=0. A dedicated terrain-following raycast would be a nicer UX but
-	// isn't required for exercising the graph->geometry pipeline this tool exists to test.
-	const float PlaneZ = (DragState == EDragState::Dragging) ? DragStartPoint.Z : 0.f;
+	// In orthographic views the "camera" sits arbitrarily far back along the view direction from
+	// whatever's under the cursor, rather than at a single perspective-projection eye point -- so
+	// the ray origin itself needs to be pulled back first, exactly like Landscape's own cursor
+	// trace (FEdModeLandscape::LandscapeMouseTrace) does, or top-down/ortho clicks miss entirely.
+	if (ViewportClient->IsOrtho())
+	{
+		Start -= WORLD_MAX * Direction;
+	}
+	const FVector End = Start + WORLD_MAX * Direction;
+
+	if (UWorld* World = GetWorld())
+	{
+		FHitResult Hit;
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(FlexNetworkCursorTrace), /*bTraceComplex=*/ true);
+		if (World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params))
+		{
+			OutPoint = Hit.Location;
+			return true;
+		}
+	}
+
+	// Nothing under the cursor (e.g. a level with no landscape/floor yet) -- fall back to a flat
+	// plane so the tool still works, through the draw's start height while placing, else world Z=0.
+	const float PlaneZ = (DrawState == EDrawState::Placing) ? DrawStartPoint.Z : 0.f;
 	if (FMath::Abs(Direction.Z) <= KINDA_SMALL_NUMBER)
 	{
 		return false;
 	}
-	const float T = (PlaneZ - Origin.Z) / Direction.Z;
+	const float T = (PlaneZ - Start.Z) / Direction.Z;
 	if (T < 0.f)
 	{
 		return false;
 	}
-	OutPoint = Origin + Direction * T;
+	OutPoint = Start + Direction * T;
 	return true;
 }
 
@@ -170,7 +201,7 @@ void FFlexNetworkEdMode::UpdatePreviewCurve()
 		return;
 	}
 
-	FVector EndPoint = bHoverValid ? HoverWorldPoint : DragStartPoint;
+	FVector EndPoint = bHoverValid ? HoverWorldPoint : DrawStartPoint;
 	if (HoverNodeId.IsValid())
 	{
 		if (const FFlexRoadNode* Node = Subsystem->GetNode(HoverNodeId))
@@ -180,46 +211,46 @@ void FFlexNetworkEdMode::UpdatePreviewCurve()
 	}
 	else
 	{
-		EndPoint = ApplyAngleSnap(DragStartPoint, EndPoint);
+		EndPoint = ApplyAngleSnap(DrawStartPoint, EndPoint);
 	}
 
-	const float HandleLength = FMath::Max(FVector::Dist(DragStartPoint, EndPoint) / 3.f, 1.f);
+	const float HandleLength = FMath::Max(FVector::Dist(DrawStartPoint, EndPoint) / 3.f, 1.f);
 
 	FVector StartTangentDir;
-	if (DragStartNodeId.IsValid())
+	if (DrawStartNodeId.IsValid())
 	{
-		StartTangentDir = Subsystem->SuggestOutgoingTangentDirection(DragStartNodeId);
+		StartTangentDir = Subsystem->SuggestOutgoingTangentDirection(DrawStartNodeId);
 	}
 	else
 	{
-		StartTangentDir = (EndPoint - DragStartPoint).GetSafeNormal(UE_SMALL_NUMBER, FVector::ForwardVector);
+		StartTangentDir = (EndPoint - DrawStartPoint).GetSafeNormal(UE_SMALL_NUMBER, FVector::ForwardVector);
 	}
 
-	PreviewCurve.P0 = DragStartPoint;
-	PreviewCurve.P1 = DragStartPoint + StartTangentDir * HandleLength;
+	PreviewCurve.P0 = DrawStartPoint;
+	PreviewCurve.P1 = DrawStartPoint + StartTangentDir * HandleLength;
 	PreviewCurve.P3 = EndPoint;
-	const FVector ApproachDir = (EndPoint - DragStartPoint).GetSafeNormal(UE_SMALL_NUMBER, StartTangentDir);
+	const FVector ApproachDir = (EndPoint - DrawStartPoint).GetSafeNormal(UE_SMALL_NUMBER, StartTangentDir);
 	PreviewCurve.P2 = EndPoint - ApproachDir * HandleLength;
 
 	const UFlexNetworkEdModeSettings* ModeSettingsPtr = GetOrCreateModeSettings();
 	bPreviewValid = Subsystem->ValidateProposedSegment(PreviewCurve, ModeSettingsPtr ? ModeSettingsPtr->ActiveProfile.Get() : nullptr, PreviewInvalidReason);
 }
 
-void FFlexNetworkEdMode::BeginDrag()
+void FFlexNetworkEdMode::BeginPlacement()
 {
-	DragState = EDragState::Dragging;
-	DragStartPoint = HoverWorldPoint;
-	DragStartNodeId = HoverNodeId;
-	DragStartSegmentId = HoverSegmentId;
-	DragStartSegmentArcLength = HoverSegmentArcLength;
+	DrawState = EDrawState::Placing;
+	DrawStartPoint = HoverWorldPoint;
+	DrawStartNodeId = HoverNodeId;
+	DrawStartSegmentId = HoverSegmentId;
+	DrawStartSegmentArcLength = HoverSegmentArcLength;
 
-	if (DragStartNodeId.IsValid())
+	if (DrawStartNodeId.IsValid())
 	{
 		if (UFlexNetworkSubsystem* Subsystem = GetSubsystem())
 		{
-			if (const FFlexRoadNode* Node = Subsystem->GetNode(DragStartNodeId))
+			if (const FFlexRoadNode* Node = Subsystem->GetNode(DrawStartNodeId))
 			{
-				DragStartPoint = Node->Position;
+				DrawStartPoint = Node->Position;
 			}
 		}
 	}
@@ -227,11 +258,11 @@ void FFlexNetworkEdMode::BeginDrag()
 	UpdatePreviewCurve();
 }
 
-void FFlexNetworkEdMode::CancelDrag()
+void FFlexNetworkEdMode::CancelPlacement()
 {
-	DragState = EDragState::Idle;
-	DragStartNodeId = FFlexNodeId::Invalid();
-	DragStartSegmentId = FFlexSegmentId::Invalid();
+	DrawState = EDrawState::Idle;
+	DrawStartNodeId = FFlexNodeId::Invalid();
+	DrawStartSegmentId = FFlexSegmentId::Invalid();
 	bPreviewValid = false;
 }
 
@@ -283,14 +314,14 @@ FFlexNodeId FFlexNetworkEdMode::ResolveEndpointNode(const FVector& WorldPoint, F
 	return Subsystem->AddNode(WorldPoint, Settings ? Settings->ActiveElevationType : EFlexRoadElevationType::Ground);
 }
 
-void FFlexNetworkEdMode::CommitDrag()
+void FFlexNetworkEdMode::CommitPlacement()
 {
 	UFlexNetworkSubsystem* Subsystem = GetSubsystem();
 	UFlexNetworkEdModeSettings* Settings = GetOrCreateModeSettings();
 
 	if (!Subsystem || !Settings || !Settings->ActiveProfile || !bPreviewValid)
 	{
-		CancelDrag();
+		CancelPlacement();
 		return;
 	}
 
@@ -298,12 +329,12 @@ void FFlexNetworkEdMode::CommitDrag()
 
 	// Resolve endpoints against the graph as it stood *before* this commit, so the crossing
 	// search below only ever considers pre-existing roads, never the one being added.
-	const FFlexNodeId StartNodeId = ResolveEndpointNode(PreviewCurve.P0, DragStartNodeId, DragStartSegmentId, DragStartSegmentArcLength);
+	const FFlexNodeId StartNodeId = ResolveEndpointNode(PreviewCurve.P0, DrawStartNodeId, DrawStartSegmentId, DrawStartSegmentArcLength);
 	const FFlexNodeId EndNodeId = ResolveEndpointNode(PreviewCurve.P3, HoverNodeId, HoverSegmentId, HoverSegmentArcLength);
 
 	if (!StartNodeId.IsValid() || !EndNodeId.IsValid() || StartNodeId == EndNodeId)
 	{
-		CancelDrag();
+		CancelPlacement();
 		return;
 	}
 
@@ -356,92 +387,49 @@ void FFlexNetworkEdMode::CommitDrag()
 
 	Subsystem->AddSegment(PreviousNodeId, EndNodeId, RemainingCurve.P1, RemainingCurve.P2, Settings->ActiveProfile, Settings->ActiveElevationType);
 
-	DragState = EDragState::Idle;
-	DragStartNodeId = FFlexNodeId::Invalid();
-	DragStartSegmentId = FFlexSegmentId::Invalid();
-	bPreviewValid = false;
+	// The new road's endpoint becomes the natural start of the next one -- continuing a chain of
+	// segments (e.g. drawing a winding street) doesn't need to re-click the same spot.
+	DrawState = EDrawState::Placing;
+	DrawStartPoint = PreviewCurve.P3;
+	DrawStartNodeId = EndNodeId;
+	DrawStartSegmentId = FFlexSegmentId::Invalid();
+	DrawStartSegmentArcLength = 0.f;
+	UpdatePreviewCurve();
 }
 
-bool FFlexNetworkEdMode::MouseMove(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 X, int32 Y)
+// ---------------------------------------------------------------- Node selection / gizmo movement
+
+bool FFlexNetworkEdMode::ShouldDrawWidget() const
 {
-	FVector WorldPoint;
-	if (ComputeGroundPlanePoint(ViewportClient, Viewport, X, Y, WorldPoint))
-	{
-		UpdateHover(WorldPoint);
-		if (DragState == EDragState::Dragging)
-		{
-			UpdatePreviewCurve();
-		}
-	}
-	return true;
+	return SelectedNodeId.IsValid();
 }
 
-bool FFlexNetworkEdMode::InputKey(FEditorViewportClient* ViewportClient, FViewport* Viewport, FKey Key, EInputEvent Event)
+FVector FFlexNetworkEdMode::GetWidgetLocation() const
 {
-	if (Key == EKeys::LeftMouseButton)
+	if (UFlexNetworkSubsystem* Subsystem = GetSubsystem())
 	{
-		if (Event == IE_Pressed)
+		if (const FFlexRoadNode* Node = Subsystem->GetNode(SelectedNodeId))
 		{
-			if (DragState == EDragState::Idle)
-			{
-				if (HoverNodeId.IsValid() && !HoverSegmentId.IsValid())
-				{
-					SelectedNodeId = HoverNodeId;
-				}
-				BeginDrag();
-			}
-			return true;
-		}
-		if (Event == IE_Released)
-		{
-			if (DragState == EDragState::Dragging)
-			{
-				CommitDrag();
-			}
-			return true;
+			return Node->Position;
 		}
 	}
-	else if (Key == EKeys::RightMouseButton || Key == EKeys::Escape)
-	{
-		if (Event == IE_Pressed && DragState == EDragState::Dragging)
-		{
-			CancelDrag();
-			return true;
-		}
-	}
-
-	return FEdMode::InputKey(ViewportClient, Viewport, Key, Event);
+	return FVector::ZeroVector;
 }
 
-void FFlexNetworkEdMode::Render(const FSceneView* View, FViewport* Viewport, FPrimitiveDrawInterface* PDI)
+bool FFlexNetworkEdMode::AllowWidgetMove()
 {
-	FEdMode::Render(View, Viewport, PDI);
-
-	UFlexNetworkSubsystem* Subsystem = GetSubsystem();
-	if (!Subsystem || !PDI)
-	{
-		return;
-	}
-
-	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Subsystem->GetAllNodes())
-	{
-		const bool bSelected = Pair.Key == SelectedNodeId;
-		const bool bHovered = Pair.Key == HoverNodeId;
-		const FColor Color = bSelected ? FColor::Yellow : (bHovered ? FColor::Cyan : FColor::White);
-		PDI->DrawPoint(Pair.Value.Position, Color, (bHovered || bSelected) ? 14.f : 8.f, SDPG_Foreground);
-	}
-
-	if (DragState == EDragState::Dragging)
-	{
-		const FColor Color = bPreviewValid ? FColor::Green : FColor::Red;
-		constexpr int32 NumSamples = 24;
-		FVector Prev = FFlexBezierMath::Evaluate(PreviewCurve, 0.f);
-		for (int32 i = 1; i <= NumSamples; ++i)
-		{
-			const float T = static_cast<float>(i) / static_cast<float>(NumSamples);
-			const FVector Next = FFlexBezierMath::Evaluate(PreviewCurve, T);
-			PDI->DrawLine(Prev, Next, Color, SDPG_Foreground, 4.f);
-			Prev = Next;
-		}
-	}
+	return SelectedNodeId.IsValid();
 }
+
+bool FFlexNetworkEdMode::UsesTransformWidget() const
+{
+	return SelectedNodeId.IsValid();
+}
+
+bool FFlexNetworkEdMode::UsesTransformWidget(UE::Widget::EWidgetMode CheckMode) const
+{
+	// Nodes only have a position, no rotation/scale -- only the translate widget makes sense.
+	return SelectedNodeId.IsValid() && CheckMode == UE::Widget::WM_Translate;
+}
+
+bool FFlexNetworkEdMode::HandleClick(FEditorViewportClient* InViewportClient, HHitPro

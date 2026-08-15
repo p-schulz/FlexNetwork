@@ -30,7 +30,9 @@ public class FlexNetworkEditor : ModuleRules
 			"ToolMenus",
 			"PropertyEditor",
 			// FEditorModeInfo/FToolkitManager live here, not in UnrealEd itself.
-			"EditorFramework"
+			"EditorFramework",
+			// FlexNetworkCreateDefaultProfilesCommand.cpp saves the generated sample profile assets.
+			"AssetRegistry"
 		});
 	}
 }
