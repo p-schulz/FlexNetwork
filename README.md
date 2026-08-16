@@ -6,10 +6,6 @@ conforming, and a queryable lane-connector graph are all *derived* from that gra
 external traffic simulation can ask "what lanes exist, where do they lead, what are their
 curves" without depending on any rendering code.
 
-See `docs/codex_prompt_ue5_road_generation_plugin.md` for the full algorithmic spec this plugin
-implements, and `docs/cities_skylines_road_generation_explained.md` for the background research
-behind it.
-
 ## Module split
 
 - **`FlexNetworkRuntime`** -- the graph, curve/geometry math, mesh generation, intersection +
