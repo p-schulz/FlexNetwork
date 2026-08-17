@@ -28,4 +28,7 @@ public:
 
 	/** Restores terrain under a segment to what it was before ConformSegment was last called for it (segment deleted, moved, or no longer needs conforming). */
 	virtual void RemoveSegmentConforming(UWorld* World, FFlexSegmentId SegmentId) = 0;
+
+	/** Samples the terrain's world-space height at Location (world-space XY). Returns false (OutHeight left unset) if no terrain covers that point -- used by the "fit roads to terrain" editor command to drape ground-level nodes onto the existing surface, the reverse of ConformSegment. */
+	virtual bool SampleHeight(UWorld* World, const FVector2D& Location, float& OutHeight) const = 0;
 };

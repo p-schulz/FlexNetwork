@@ -57,6 +57,20 @@ public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
 
+	// ---------------------------------------------------------------- Batch updates
+
+	/**
+	 * Suppresses RebuildDirty() from actually running (it just keeps accumulating the dirty set)
+	 * until a matching EndBatchUpdate brings the nesting count back to zero, at which point one
+	 * combined rebuild covers everything touched in between. Without this, bulk-loading something
+	 * like an OSM import -- hundreds or thousands of AddSegment calls -- would trigger a full
+	 * incremental-rebuild pass (arc-length tables, junction polygons, mesh generation) after
+	 * *every single call*, which is wasted work multiplied by the size of the import. Calls nest;
+	 * always pair with EndBatchUpdate (e.g. via a scope guard) even on early-out/error paths.
+	 */
+	void BeginBatchUpdate();
+	void EndBatchUpdate();
+
 	// ---------------------------------------------------------------- Mutation API
 
 	FFlexNodeId AddNode(const FVector& Position, EFlexRoadElevationType ElevationType = EFlexRoadElevationType::Ground, const FVector& UpVector = FVector::UpVector);
@@ -77,6 +91,14 @@ public:
 
 	/** Splits Segment at ArcLength (De Casteljau exact split), inserting a new node there. Returns the new node's id, or an invalid id if SegmentId/ArcLength are invalid. */
 	FFlexNodeId SplitSegment(FFlexSegmentId SegmentId, float ArcLength);
+
+	// ---------------------------------------------------------------- Terrain (bulk editor commands)
+
+	/** Force-reconforms terrain under every Ground segment to the current road heights, regardless of dirty state -- backs the toolkit's "Conform Terrain To Roads" command (e.g. to re-apply after the landscape was hand-edited since the last rebuild). Bridge/Elevated/Tunnel/Ramp segments are untouched, same as the automatic per-mutation conforming. */
+	void ConformAllTerrainToRoads();
+
+	/** Samples terrain height under every Ground node and snaps it there, draping the network onto the landscape's actual surface -- backs the toolkit's "Fit Roads To Terrain" command. Bridge/Elevated/Tunnel/Ramp nodes are left untouched (their elevation is deliberately offset from ground, not meant to be re-snapped to it). No-op per node if there's no terrain conformer or no landscape under it. */
+	void FitNodesToTerrain();
 
 	// ---------------------------------------------------------------- Snap / crossing queries (drives the editor drawing tool)
 
@@ -155,6 +177,7 @@ private:
 
 	TSet<FFlexNodeId> DirtyNodes;
 	TSet<FFlexSegmentId> DirtySegments;
+	int32 BatchDepth = 0;
 
 	AFlexNetworkMeshActor* GetOrCreateMeshActor();
 	const UFlexNetworkSettings* GetSettings() const;

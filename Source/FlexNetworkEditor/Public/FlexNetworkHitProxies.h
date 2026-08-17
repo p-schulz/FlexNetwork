@@ -17,3 +17,17 @@ struct HFlexNodeHitProxy : public HHitProxy
 	{
 	}
 };
+
+/** Lets FFlexNetworkEdMode::HandleClick identify exactly which graph segment a viewport click landed on, for selection (and delete) -- no gizmo movement, a segment has no single position to drag. */
+struct HFlexSegmentHitProxy : public HHitProxy
+{
+	DECLARE_HIT_PROXY()
+
+	FFlexSegmentId SegmentId;
+
+	explicit HFlexSegmentHitProxy(FFlexSegmentId InSegmentId)
+		: HHitProxy(HPP_UI)
+		, SegmentId(InSegmentId)
+	{
+	}
+};

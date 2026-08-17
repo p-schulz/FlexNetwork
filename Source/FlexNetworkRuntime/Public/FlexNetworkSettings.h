@@ -45,6 +45,38 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category = "Intersections", meta = (ClampMin = "1.0", Units = "cm"))
 	float CrosswalkWidth = 200.f;
 
+	/**
+	 * Radius (cm) of the rounded corner island/curb return the sidewalk sweeps around at each
+	 * junction corner -- independent of DefaultFilletRadius (which is only the *drivable* polygon
+	 * corner's fallback rounding): real curb returns are typically a good deal larger than a tight
+	 * pavement-corner fillet, so this defaults bigger.
+	 */
+	UPROPERTY(EditAnywhere, Config, Category = "Intersections", meta = (ClampMin = "1.0", Units = "cm"))
+	float CurbReturnRadius = 450.f;
+
+	/** How many segments each corner island/sidewalk-band arc is sampled with; higher = smoother curve. */
+	UPROPERTY(EditAnywhere, Config, Category = "Intersections", meta = (ClampMin = "2", ClampMax = "32"))
+	int32 CurbReturnArcSegments = 12;
+
+	/**
+	 * Minimum angle (degrees) between two angularly-adjacent approaches at a junction for that
+	 * pair to be treated as a genuine corner. Below this, the two roads are near-parallel (e.g.
+	 * two carriageways of a divided road meeting at a shallow angle) and get no curb-return
+	 * sidewalk band/island between them -- sidewalks only bridge real corners, never a gap
+	 * between roads that are essentially continuing in the same direction.
+	 */
+	UPROPERTY(EditAnywhere, Config, Category = "Intersections", meta = (ClampMin = "0.0", ClampMax = "90.0", Units = "deg"))
+	float ParallelApproachAngleToleranceDegrees = 30.f;
+
+	/**
+	 * Vertical offset (cm) every generated road/junction mesh sits above its own logical height --
+	 * terrain conforming flattens the landscape to that same logical height, so without this the
+	 * generated meshes and the landscape underneath them are exactly coplanar and z-fight. Applied
+	 * as a uniform component-level offset (see AFlexNetworkMeshActor), not baked into vertex data.
+	 */
+	UPROPERTY(EditAnywhere, Config, Category = "Mesh", meta = (ClampMin = "0.0", Units = "cm"))
+	float MeshZFightOffset = 1.f;
+
 	/** Target distance (cm) between arc-length mesh-extrusion samples along a segment. */
 	UPROPERTY(EditAnywhere, Config, Category = "Mesh", meta = (ClampMin = "1.0", Units = "cm"))
 	float ArcLengthSampleStep = 100.f;

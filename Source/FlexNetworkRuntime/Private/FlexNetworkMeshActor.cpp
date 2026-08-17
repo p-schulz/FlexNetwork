@@ -1,5 +1,7 @@
 #include "FlexNetworkMeshActor.h"
 #include "ProceduralMeshComponent.h"
+#include "FlexNetworkSettings.h"
+#include "Components/SplineMeshComponent.h"
 
 namespace
 {
@@ -7,6 +9,8 @@ namespace
 	constexpr int32 kSidewalkSection = 1;
 	constexpr int32 kJunctionSurfaceSection = 0;
 	constexpr int32 kJunctionCrosswalkSection = 1;
+	constexpr int32 kJunctionSidewalkCornerSection = 2;
+	constexpr int32 kJunctionCornerIslandSection = 3;
 }
 
 AFlexNetworkMeshActor::AFlexNetworkMeshActor()
@@ -29,6 +33,10 @@ UProceduralMeshComponent* AFlexNetworkMeshActor::GetOrCreateComponent(TMap<FFlex
 	Comp->SetupAttachment(RootSceneComponent);
 	Comp->RegisterComponent();
 	Comp->SetMobility(EComponentMobility::Movable);
+	// Raises the whole component (and so every section it hosts) a hair above the mesh's own
+	// logical height, which is what terrain conforming flattens the landscape *to* -- without
+	// this, road/junction meshes and the landscape underneath are exactly coplanar and z-fight.
+	Comp->SetRelativeLocation(FVector(0.f, 0.f, GetDefault<UFlexNetworkSettings>()->MeshZFightOffset));
 	Map.Add(Id, Comp);
 	return Comp;
 }
@@ -44,6 +52,7 @@ UProceduralMeshComponent* AFlexNetworkMeshActor::GetOrCreateComponent(TMap<FFlex
 	Comp->SetupAttachment(RootSceneComponent);
 	Comp->RegisterComponent();
 	Comp->SetMobility(EComponentMobility::Movable);
+	Comp->SetRelativeLocation(FVector(0.f, 0.f, GetDefault<UFlexNetworkSettings>()->MeshZFightOffset));
 	Map.Add(Id, Comp);
 	return Comp;
 }
@@ -100,6 +109,8 @@ void AFlexNetworkMeshActor::ApplyJunctionMesh(FFlexNodeId NodeId, const FFlexJun
 	UProceduralMeshComponent* Comp = GetOrCreateComponent(JunctionComponents, NodeId, TEXT("Junction"));
 	ApplySectionData(Comp, kJunctionSurfaceSection, MeshResult.Surface);
 	ApplySectionData(Comp, kJunctionCrosswalkSection, MeshResult.Crosswalks);
+	ApplySectionData(Comp, kJunctionSidewalkCornerSection, MeshResult.SidewalkCorners);
+	ApplySectionData(Comp, kJunctionCornerIslandSection, MeshResult.CornerIslands);
 }
 
 void AFlexNetworkMeshActor::RemoveJunctionMesh(FFlexNodeId NodeId)
@@ -107,6 +118,51 @@ void AFlexNetworkMeshActor::RemoveJunctionMesh(FFlexNodeId NodeId)
 	if (TObjectPtr<UProceduralMeshComponent> Comp; JunctionComponents.RemoveAndCopyValue(NodeId, Comp) && Comp)
 	{
 		Comp->DestroyComponent();
+	}
+}
+
+void AFlexNetworkMeshActor::ApplyCurbstones(const TArray<TArray<FVector>>& CurbLines, UStaticMesh* Mesh)
+{
+	for (USplineMeshComponent* Comp : CurbstoneComponents)
+	{
+		if (Comp)
+		{
+			Comp->DestroyComponent();
+		}
+	}
+	CurbstoneComponents.Reset();
+
+	if (!Mesh)
+	{
+		return;
+	}
+
+	int32 NameCounter = 0;
+	for (const TArray<FVector>& Line : CurbLines)
+	{
+		for (int32 i = 0; i + 1 < Line.Num(); ++i)
+		{
+			const FVector& Start = Line[i];
+			const FVector& End = Line[i + 1];
+			// A straight chord between consecutive samples rather than the curve's own tangent --
+			// simple, and the curb line is already sampled finely enough (per-segment arc-length
+			// step, or per-corner arc-segment count) that the chord and the true tangent are
+			// visually indistinguishable at that spacing.
+			const FVector Tangent = End - Start;
+			if (Tangent.IsNearlyZero())
+			{
+				continue;
+			}
+
+			USplineMeshComponent* Comp = NewObject<USplineMeshComponent>(this, *FString::Printf(TEXT("Curbstone_%d"), NameCounter++));
+			Comp->SetMobility(EComponentMobility::Movable);
+			Comp->SetStaticMesh(Mesh);
+			Comp->SetForwardAxis(ESplineMeshAxis::X);
+			Comp->SetupAttachment(RootSceneComponent);
+			Comp->RegisterComponent();
+			Comp->SetStartAndEnd(Start, Tangent, End, Tangent, true);
+			CurbstoneComponents.Add(Comp);
+		}
 	}
 }
 
@@ -129,4 +185,13 @@ void AFlexNetworkMeshActor::ClearAll()
 		}
 	}
 	JunctionComponents.Reset();
+
+	for (USplineMeshComponent* Comp : CurbstoneComponents)
+	{
+		if (Comp)
+		{
+			Comp->DestroyComponent();
+		}
+	}
+	CurbstoneComponents.Reset();
 }

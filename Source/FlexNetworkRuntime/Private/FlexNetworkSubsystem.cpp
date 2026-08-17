@@ -407,6 +407,48 @@ FFlexNodeId UFlexNetworkSubsystem::SplitSegment(FFlexSegmentId SegmentId, float 
 	return NewNodeId;
 }
 
+// ---------------------------------------------------------------- Terrain (bulk editor commands)
+
+void UFlexNetworkSubsystem::ConformAllTerrainToRoads()
+{
+	if (!TerrainConformer)
+	{
+		return;
+	}
+	// Reuses RebuildDirty()'s existing per-segment conforming (and its Ground-only guard) rather
+	// than duplicating the frame-building/conforming call here -- marking everything dirty and
+	// letting the normal rebuild path run is simpler and can't drift out of sync with it.
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		DirtySegments.Add(Pair.Key);
+	}
+	RebuildDirty();
+}
+
+void UFlexNetworkSubsystem::FitNodesToTerrain()
+{
+	if (!TerrainConformer)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	BeginBatchUpdate();
+	for (TPair<FFlexNodeId, FFlexRoadNode>& Pair : Nodes)
+	{
+		if (Pair.Value.ElevationType != EFlexRoadElevationType::Ground)
+		{
+			continue;
+		}
+		float SampledHeight = 0.f;
+		if (TerrainConformer->SampleHeight(World, FVector2D(Pair.Value.Position.X, Pair.Value.Position.Y), SampledHeight))
+		{
+			SetNodePosition(Pair.Key, FVector(Pair.Value.Position.X, Pair.Value.Position.Y, SampledHeight));
+		}
+	}
+	EndBatchUpdate();
+}
+
 // ---------------------------------------------------------------- Snap / crossing queries
 
 bool UFlexNetworkSubsystem::FindNearestNode(const FVector& WorldPosition, float Radius, FFlexNodeId& OutNodeId) const
@@ -703,8 +745,30 @@ TArray<FFlexJunctionApproachInput> UFlexNetworkSubsystem::BuildApproachInputs(FF
 	return Result;
 }
 
+void UFlexNetworkSubsystem::BeginBatchUpdate()
+{
+	++BatchDepth;
+}
+
+void UFlexNetworkSubsystem::EndBatchUpdate()
+{
+	if (!ensure(BatchDepth > 0))
+	{
+		return;
+	}
+	if (--BatchDepth == 0)
+	{
+		RebuildDirty();
+	}
+}
+
 void UFlexNetworkSubsystem::RebuildDirty()
 {
+	if (BatchDepth > 0)
+	{
+		return; // Accumulate only -- EndBatchUpdate will trigger the real (combined) rebuild.
+	}
+
 	if (DirtySegments.Num() == 0 && DirtyNodes.Num() == 0)
 	{
 		return;
@@ -799,7 +863,7 @@ void UFlexNetworkSubsystem::RebuildDirty()
 			NewRoleFlags &= ~static_cast<uint8>(EFlexNodeRole::Bend);
 
 			const float FilletRadius = Node->FilletRadiusOverride > 0.f ? Node->FilletRadiusOverride : Settings->DefaultFilletRadius;
-			FFlexJunctionData JunctionData = FFlexIntersectionBuilder::BuildJunction(Node->Position, Node->UpVector, Approaches, FilletRadius, Settings->CrosswalkWidth, Settings->CrosswalkMinClearance);
+			FFlexJunctionData JunctionData = FFlexIntersectionBuilder::BuildJunction(Node->Position, Node->UpVector, Approaches, FilletRadius, Settings->CrosswalkWidth, Settings->CrosswalkMinClearance, Settings->CurbReturnRadius, Settings->ParallelApproachAngleToleranceDegrees, 8, Settings->CurbReturnArcSegments);
 
 			for (const TPair<FFlexSegmentId, float>& TrimPair : JunctionData.TrimArcLengthBySegment)
 			{
@@ -873,7 +937,11 @@ void UFlexNetworkSubsystem::RebuildDirty()
 			Actor->ApplySegmentMesh(SegId, MeshResults[Index]);
 		}
 
-		if (TerrainConformer && Segment->Profile)
+		// Only Ground segments get the terrain flattened to their height -- a Bridge/Elevated
+		// segment sits above the terrain by design (flattening under it would visually merge the
+		// deck into the ground, defeating the point), and Tunnel/Ramp don't have a sensible single
+		// "flatten to this height" interpretation either.
+		if (TerrainConformer && Segment->Profile && Segment->ElevationType == EFlexRoadElevationType::Ground)
 		{
 			const FVector RefUp = Nodes.Contains(Segment->StartNodeId) ? Nodes.FindChecked(Segment->StartNodeId).UpVector : FVector::UpVector;
 			const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(Segment->Curve, Segment->ArcLengthTable, RefUp, Settings->ArcLengthSampleStep, MeshResults[Index].TrimStartArcLength, MeshResults[Index].TrimEndArcLength);
@@ -894,6 +962,8 @@ void UFlexNetworkSubsystem::RebuildDirty()
 		{
 			UMaterialInterface* SurfaceMaterial = nullptr;
 			UMaterialInterface* CrosswalkMaterial = nullptr;
+			UMaterialInterface* SidewalkMaterial = nullptr;
+			UMaterialInterface* MedianMaterial = nullptr;
 			if (Node->ConnectedSegments.Num() > 0)
 			{
 				if (const FFlexRoadSegment* FirstSegment = Segments.Find(Node->ConnectedSegments[0]))
@@ -902,10 +972,12 @@ void UFlexNetworkSubsystem::RebuildDirty()
 					{
 						SurfaceMaterial = FirstSegment->Profile->JunctionMaterial;
 						CrosswalkMaterial = FirstSegment->Profile->SidewalkMaterial;
+						SidewalkMaterial = FirstSegment->Profile->SidewalkMaterial;
+						MedianMaterial = FirstSegment->Profile->MedianMaterial;
 					}
 				}
 			}
-			const FFlexJunctionMeshResult JunctionMesh = FFlexIntersectionBuilder::BuildJunctionMesh(Node->UpVector, *JunctionData, SurfaceMaterial, CrosswalkMaterial);
+			const FFlexJunctionMeshResult JunctionMesh = FFlexIntersectionBuilder::BuildJunctionMesh(Node->UpVector, *JunctionData, SurfaceMaterial, CrosswalkMaterial, SidewalkMaterial, MedianMaterial);
 			if (Actor)
 			{
 				Actor->ApplyJunctionMesh(NodeId, JunctionMesh);

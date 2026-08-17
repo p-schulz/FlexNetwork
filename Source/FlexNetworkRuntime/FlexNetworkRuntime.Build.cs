@@ -17,7 +17,10 @@ public class FlexNetworkRuntime : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"DeveloperSettings",
-			"ProceduralMeshComponent"
+			"ProceduralMeshComponent",
+			// FOsmXmlParser (Osm/OsmXmlParser.cpp) -- a plain Runtime module, not editor-only, so
+			// OSM data can be parsed outside the Content Browser import flow too.
+			"XmlParser"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new[]

@@ -7,12 +7,15 @@
 #include "FlexNetworkMeshActor.generated.h"
 
 class UProceduralMeshComponent;
+class USplineMeshComponent;
+class UStaticMesh;
 
 /**
  * Hosts the generated UProceduralMeshComponents for one FlexNetwork graph: one component per
  * segment (section 0 = roadway, section 1 = sidewalks) and one per junction (section 0 =
- * surface, section 1 = crosswalks). UWorldSubsystem can't own components directly, so
- * UFlexNetworkSubsystem lazily spawns and drives one of these per world instead.
+ * surface, section 1 = crosswalks, section 2 = sidewalk corner bands, section 3 = landscaped
+ * corner islands). UWorldSubsystem can't own components directly, so UFlexNetworkSubsystem
+ * lazily spawns and drives one of these per world instead.
  */
 UCLASS(NotBlueprintable)
 class FLEXNETWORKRUNTIME_API AFlexNetworkMeshActor : public AActor
@@ -28,6 +31,14 @@ public:
 	void ApplyJunctionMesh(FFlexNodeId NodeId, const FFlexJunctionMeshResult& MeshResult);
 	void RemoveJunctionMesh(FFlexNodeId NodeId);
 
+	/**
+	 * Replaces every previously-generated curbstone with a fresh set: for each entry in CurbLines
+	 * (a polyline of consecutive world-space points to run curbstones along), spawns one
+	 * USplineMeshComponent per point-pair, spline-fit between them with Mesh's local X axis as the
+	 * spline's forward direction. A no-op (just clears existing curbstones) if Mesh is null.
+	 */
+	void ApplyCurbstones(const TArray<TArray<FVector>>& CurbLines, UStaticMesh* Mesh);
+
 	void ClearAll();
 
 private:
@@ -39,6 +50,9 @@ private:
 
 	UPROPERTY()
 	TMap<FFlexNodeId, TObjectPtr<UProceduralMeshComponent>> JunctionComponents;
+
+	UPROPERTY()
+	TArray<TObjectPtr<USplineMeshComponent>> CurbstoneComponents;
 
 	UProceduralMeshComponent* GetOrCreateComponent(TMap<FFlexSegmentId, TObjectPtr<UProceduralMeshComponent>>& Map, FFlexSegmentId Id, const TCHAR* NamePrefix);
 	UProceduralMeshComponent* GetOrCreateComponent(TMap<FFlexNodeId, TObjectPtr<UProceduralMeshComponent>>& Map, FFlexNodeId Id, const TCHAR* NamePrefix);

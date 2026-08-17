@@ -75,6 +75,14 @@ UFlexNetworkEdModeSettings* FFlexNetworkEdMode::GetOrCreateModeSettings() const
 	{
 		ModeSettings = NewObject<UFlexNetworkEdModeSettings>(GetTransientPackage(), NAME_None, RF_Transactional);
 	}
+	// Refreshed on every call, not just at creation: ModeSettings itself persists for the whole
+	// editor session (it's a member of this FFlexNetworkEdMode, which outlives any one level), so
+	// caching TargetWorld only once would go stale the moment the user changes/reloads levels
+	// while still in this mode -- silently pointing GenerateRoadsFromOsm() at a world that's no
+	// longer the one being viewed. Every other operation (draw, select/move) already avoids this
+	// by calling GetWorld() fresh each time via GetSubsystem(); this keeps the OSM path consistent
+	// with that instead of being the one place with a caching bug.
+	ModeSettings->TargetWorld = GetWorld();
 	return ModeSettings;
 }
 
@@ -432,4 +440,204 @@ bool FFlexNetworkEdMode::UsesTransformWidget(UE::Widget::EWidgetMode CheckMode) 
 	return SelectedNodeId.IsValid() && CheckMode == UE::Widget::WM_Translate;
 }
 
-bool FFlexNetworkEdMode::HandleClick(FEditorViewportClient* InViewportClient, HHitPro
+bool FFlexNetworkEdMode::HandleClick(FEditorViewportClient* InViewportClient, HHitProxy* HitProxy, const FViewportClick& Click)
+{
+	if (IsDrawModeActive())
+	{
+		// Placement clicks are handled in InputKey instead, so drawing and node-selection clicks
+		// (which use two different gestures) never fight over the same mouse-down event.
+		return false;
+	}
+
+	if (HitProxy && HitProxy->IsA(HFlexNodeHitProxy::StaticGetType()))
+	{
+		SelectedNodeId = static_cast<HFlexNodeHitProxy*>(HitProxy)->NodeId;
+		SelectedSegmentId = FFlexSegmentId::Invalid();
+		return true;
+	}
+
+	if (HitProxy && HitProxy->IsA(HFlexSegmentHitProxy::StaticGetType()))
+	{
+		SelectedSegmentId = static_cast<HFlexSegmentHitProxy*>(HitProxy)->SegmentId;
+		SelectedNodeId = FFlexNodeId::Invalid();
+		return true;
+	}
+
+	SelectedNodeId = FFlexNodeId::Invalid();
+	SelectedSegmentId = FFlexSegmentId::Invalid();
+	return FEdMode::HandleClick(InViewportClient, HitProxy, Click);
+}
+
+bool FFlexNetworkEdMode::StartTracking(FEditorViewportClient* InViewportClient, FViewport* InViewport)
+{
+	if (SelectedNodeId.IsValid())
+	{
+		ActiveNodeMoveTransaction = MakeUnique<FScopedTransaction>(NSLOCTEXT("FlexNetwork", "MoveNode", "Move Flex Road Node"));
+		return true;
+	}
+	return FEdMode::StartTracking(InViewportClient, InViewport);
+}
+
+bool FFlexNetworkEdMode::EndTracking(FEditorViewportClient* InViewportClient, FViewport* InViewport)
+{
+	if (ActiveNodeMoveTransaction.IsValid())
+	{
+		ActiveNodeMoveTransaction.Reset();
+		return true;
+	}
+	return FEdMode::EndTracking(InViewportClient, InViewport);
+}
+
+bool FFlexNetworkEdMode::InputDelta(FEditorViewportClient* InViewportClient, FViewport* InViewport, FVector& InDrag, FRotator& InRot, FVector& InScale)
+{
+	if (SelectedNodeId.IsValid() && !InDrag.IsNearlyZero())
+	{
+		if (UFlexNetworkSubsystem* Subsystem = GetSubsystem())
+		{
+			if (const FFlexRoadNode* Node = Subsystem->GetNode(SelectedNodeId))
+			{
+				Subsystem->SetNodePosition(SelectedNodeId, Node->Position + InDrag);
+			}
+		}
+		return true;
+	}
+	return FEdMode::InputDelta(InViewportClient, InViewport, InDrag, InRot, InScale);
+}
+
+void FFlexNetworkEdMode::DeleteSelection()
+{
+	UFlexNetworkSubsystem* Subsystem = GetSubsystem();
+	if (!Subsystem)
+	{
+		return;
+	}
+
+	if (SelectedNodeId.IsValid())
+	{
+		FScopedTransaction Transaction(NSLOCTEXT("FlexNetwork", "DeleteNode", "Delete Flex Road Node"));
+		Subsystem->RemoveNode(SelectedNodeId); // Cascades to remove every segment still connected to it.
+		SelectedNodeId = FFlexNodeId::Invalid();
+	}
+	else if (SelectedSegmentId.IsValid())
+	{
+		FScopedTransaction Transaction(NSLOCTEXT("FlexNetwork", "DeleteSegment", "Delete Flex Road Segment"));
+		Subsystem->RemoveSegment(SelectedSegmentId); // Leaves both endpoint nodes in place, even if orphaned.
+		SelectedSegmentId = FFlexSegmentId::Invalid();
+	}
+}
+
+// ---------------------------------------------------------------- Input / render
+
+bool FFlexNetworkEdMode::MouseMove(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 X, int32 Y)
+{
+	FVector WorldPoint;
+	if (TraceCursorToWorld(ViewportClient, Viewport, X, Y, WorldPoint))
+	{
+		UpdateHover(WorldPoint);
+		if (DrawState == EDrawState::Placing)
+		{
+			UpdatePreviewCurve();
+		}
+	}
+	return true;
+}
+
+bool FFlexNetworkEdMode::InputKey(FEditorViewportClient* ViewportClient, FViewport* Viewport, FKey Key, EInputEvent Event)
+{
+	if (IsDrawModeActive() && Key == EKeys::LeftMouseButton)
+	{
+		if (Event == IE_Pressed)
+		{
+			if (DrawState == EDrawState::Idle)
+			{
+				BeginPlacement();
+			}
+			else
+			{
+				CommitPlacement();
+			}
+		}
+		return true; // Own the whole click stream in draw mode -- no drag-tracking/base click handling to fall through to.
+	}
+
+	if (Key == EKeys::RightMouseButton || Key == EKeys::Escape)
+	{
+		if (Event == IE_Pressed && DrawState == EDrawState::Placing)
+		{
+			CancelPlacement();
+			return true;
+		}
+	}
+
+	if (Key == EKeys::Delete || Key == EKeys::Platform_Delete)
+	{
+		if (Event == IE_Pressed && (SelectedNodeId.IsValid() || SelectedSegmentId.IsValid()))
+		{
+			DeleteSelection();
+			return true;
+		}
+	}
+
+	return FEdMode::InputKey(ViewportClient, Viewport, Key, Event);
+}
+
+void FFlexNetworkEdMode::Render(const FSceneView* View, FViewport* Viewport, FPrimitiveDrawInterface* PDI)
+{
+	FEdMode::Render(View, Viewport, PDI);
+
+	UFlexNetworkSubsystem* Subsystem = GetSubsystem();
+	if (!Subsystem || !PDI)
+	{
+		return;
+	}
+
+	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Subsystem->GetAllNodes())
+	{
+		const bool bSelected = Pair.Key == SelectedNodeId;
+		const bool bHovered = Pair.Key == HoverNodeId;
+		const FColor Color = bSelected ? FColor::Yellow : (bHovered ? FColor::Cyan : FColor::White);
+
+		// Hit-proxied so HandleClick can tell exactly which node was clicked (Select/Move mode);
+		// harmless to leave the proxy active in Draw mode too, since HandleClick there just
+		// returns false and defers to the placement click handled in InputKey instead.
+		PDI->SetHitProxy(new HFlexNodeHitProxy(Pair.Key));
+		PDI->DrawPoint(Pair.Value.Position, Color, (bHovered || bSelected) ? 16.f : 10.f, SDPG_Foreground);
+		PDI->SetHitProxy(nullptr);
+	}
+
+	// A thin hit-proxied line along each segment's curve so it can be click-selected (Select/Move
+	// mode) even though the segment's own generated mesh has no hit proxy of its own -- the actual
+	// road mesh already shows the segment visually, so this stays unobtrusive except when selected.
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Subsystem->GetAllSegments())
+	{
+		const bool bSelected = Pair.Key == SelectedSegmentId;
+		const FColor Color = bSelected ? FColor::Yellow : FColor(255, 255, 255, 64);
+		const float Thickness = bSelected ? 6.f : 1.f;
+
+		PDI->SetHitProxy(new HFlexSegmentHitProxy(Pair.Key));
+		constexpr int32 NumSamples = 16;
+		FVector Prev = FFlexBezierMath::Evaluate(Pair.Value.Curve, 0.f);
+		for (int32 i = 1; i <= NumSamples; ++i)
+		{
+			const float T = static_cast<float>(i) / static_cast<float>(NumSamples);
+			const FVector Next = FFlexBezierMath::Evaluate(Pair.Value.Curve, T);
+			PDI->DrawLine(Prev, Next, Color, SDPG_Foreground, Thickness);
+			Prev = Next;
+		}
+		PDI->SetHitProxy(nullptr);
+	}
+
+	if (DrawState == EDrawState::Placing)
+	{
+		const FColor Color = bPreviewValid ? FColor::Green : FColor::Red;
+		constexpr int32 NumSamples = 24;
+		FVector Prev = FFlexBezierMath::Evaluate(PreviewCurve, 0.f);
+		for (int32 i = 1; i <= NumSamples; ++i)
+		{
+			const float T = static_cast<float>(i) / static_cast<float>(NumSamples);
+			const FVector Next = FFlexBezierMath::Evaluate(PreviewCurve, T);
+			PDI->DrawLine(Prev, Next, Color, SDPG_Foreground, 4.f);
+			Prev = Next;
+		}
+	}
+}

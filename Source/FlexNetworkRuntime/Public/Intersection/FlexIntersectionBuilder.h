@@ -54,7 +54,10 @@ public:
 		float DefaultFilletRadius,
 		float CrosswalkWidth,
 		float CrosswalkMinClearance,
-		int32 FilletArcSegments = 8);
+		float CurbReturnRadius,
+		float ParallelApproachAngleToleranceDegrees,
+		int32 FilletArcSegments = 8,
+		int32 CurbReturnArcSegments = 12);
 
-	static FFlexJunctionMeshResult BuildJunctionMesh(const FVector& NodeUp, const FFlexJunctionData& JunctionData, UMaterialInterface* SurfaceMaterial, UMaterialInterface* CrosswalkMaterial);
+	static FFlexJunctionMeshResult BuildJunctionMesh(const FVector& NodeUp, const FFlexJunctionData& JunctionData, UMaterialInterface* SurfaceMaterial, UMaterialInterface* CrosswalkMaterial, UMaterialInterface* SidewalkMaterial, UMaterialInterface* MedianMaterial);
 };

@@ -22,6 +22,10 @@ public:
 	 * TrimStartArcLength/TrimEndArcLength restrict extrusion to a sub-range of the curve (used to
 	 * cut a segment's mesh off at a junction polygon boundary instead of extruding all the way to
 	 * the node center); pass 0 and ArcLengthTable.GetTotalLength() for an untrimmed segment.
+	 * Sidewalks are trimmed at the same points as the roadway -- the junction side is responsible
+	 * for extending its own curb-return sidewalk bands out to meet that same point on each edge
+	 * (see FFlexIntersectionBuilder::BuildJunctionCornersForRadius), so this trim doesn't need its
+	 * own independent value.
 	 */
 	static FFlexSegmentMeshResult BuildSegmentMesh(
 		const FFlexBezierCurve& Curve,

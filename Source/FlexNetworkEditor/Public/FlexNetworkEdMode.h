@@ -79,7 +79,11 @@ private:
 	FText PreviewInvalidReason;
 
 	FFlexNodeId SelectedNodeId; // Drives the transform-widget hooks above for click-select + gizmo-drag node movement.
+	FFlexSegmentId SelectedSegmentId; // Click-select only -- a segment has no single position, so no gizmo movement for it.
 	TUniquePtr<FScopedTransaction> ActiveNodeMoveTransaction;
+
+	/** Deletes whichever of SelectedNodeId/SelectedSegmentId is currently valid (node takes priority, matching HandleClick's mutual exclusivity), wrapped in one undo transaction. */
+	void DeleteSelection();
 
 	mutable TObjectPtr<UFlexNetworkEdModeSettings> ModeSettings = nullptr;
 

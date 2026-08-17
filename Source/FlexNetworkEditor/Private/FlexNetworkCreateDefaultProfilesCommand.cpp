@@ -1,9 +1,6 @@
 #include "HAL/IConsoleManager.h"
 #include "RoadTypeProfile.h"
-#include "AssetRegistry/AssetRegistryModule.h"
-#include "UObject/Package.h"
-#include "UObject/SavePackage.h"
-#include "Misc/PackageName.h"
+#include "FlexNetworkAssetUtils.h"
 
 // The plugin ships no default URoadTypeProfile assets (a data-driven asset is inherently
 // project-specific -- there's no single "correct" lane layout to bake in). This console command
@@ -12,32 +9,6 @@
 // Log: `FlexNetwork.CreateDefaultProfiles`.
 namespace
 {
-	URoadTypeProfile* CreateProfileAsset(const FString& AssetName, TFunctionRef<void(URoadTypeProfile&)> Configure)
-	{
-		const FString PackagePath = TEXT("/FlexNetwork/Profiles/") + AssetName;
-
-		UPackage* Package = CreatePackage(*PackagePath);
-		if (!Package)
-		{
-			return nullptr;
-		}
-
-		URoadTypeProfile* Profile = NewObject<URoadTypeProfile>(Package, URoadTypeProfile::StaticClass(), *AssetName, RF_Public | RF_Standalone);
-		Configure(*Profile);
-
-		FAssetRegistryModule::AssetCreated(Profile);
-		Package->MarkPackageDirty();
-
-		FSavePackageArgs SaveArgs;
-		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.SaveFlags = SAVE_NoError;
-
-		const FString PackageFileName = FPackageName::LongPackageNameToFilename(PackagePath, FPackageName::GetAssetPackageExtension());
-		UPackage::SavePackage(Package, Profile, *PackageFileName, SaveArgs);
-
-		return Profile;
-	}
-
 	FRoadLaneDescriptor MakeVehicleLane(const TCHAR* Name, float LateralOffset, float Width, EFlexLaneDirection Direction, float SpeedLimitKmh)
 	{
 		FRoadLaneDescriptor Lane;
@@ -53,8 +24,9 @@ namespace
 	void CreateDefaultRoadProfiles()
 	{
 		int32 NumCreated = 0;
+		const FString ProfilesPath = TEXT("/FlexNetwork/Profiles");
 
-		if (CreateProfileAsset(TEXT("DA_Road_Residential"), [](URoadTypeProfile& P)
+		if (FlexNetworkAssetUtils::CreateRoadTypeProfileAsset(ProfilesPath, TEXT("DA_Road_Residential"), [](URoadTypeProfile& P)
 		{
 			P.Lanes = {
 				MakeVehicleLane(TEXT("Forward"), 175.f, 350.f, EFlexLaneDirection::Forward, 50.f),
@@ -69,7 +41,7 @@ namespace
 			++NumCreated;
 		}
 
-		if (CreateProfileAsset(TEXT("DA_Road_Arterial"), [](URoadTypeProfile& P)
+		if (FlexNetworkAssetUtils::CreateRoadTypeProfileAsset(ProfilesPath, TEXT("DA_Road_Arterial"), [](URoadTypeProfile& P)
 		{
 			P.Lanes = {
 				MakeVehicleLane(TEXT("Forward_Inner"), 175.f, 350.f, EFlexLaneDirection::Forward, 70.f),
@@ -86,7 +58,7 @@ namespace
 			++NumCreated;
 		}
 
-		if (CreateProfileAsset(TEXT("DA_Footpath"), [](URoadTypeProfile& P)
+		if (FlexNetworkAssetUtils::CreateRoadTypeProfileAsset(ProfilesPath, TEXT("DA_Footpath"), [](URoadTypeProfile& P)
 		{
 			// No vehicle lanes at all: the walkable width comes entirely from the sidewalk offset
 			// (see URoadTypeProfile::GetRoadwayHalfWidth -- an empty Lanes array makes it 0, so the

@@ -88,6 +88,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")
 	TObjectPtr<UMaterialInterface> JunctionMaterial = nullptr;
 
+	/** Fill for the rounded corner islands/refuges the sidewalk curves around at junctions (grass/landscaping is typical -- falls back to SidewalkMaterial if left unset). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")
+	TObjectPtr<UMaterialInterface> MedianMaterial = nullptr;
+
 	/** Distance (cm) between the centerline and the outermost extent of this profile on one side (drivable lanes + sidewalk). Used by the intersection builder's outer-edge extrapolation. */
 	float GetOuterExtent() const;
 

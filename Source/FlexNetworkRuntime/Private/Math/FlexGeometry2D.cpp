@@ -52,10 +52,8 @@ float FlexGeometry2D::SignedArea(TArrayView<const FVector2D> Polygon)
 	return Area * 0.5f;
 }
 
-bool FlexGeometry2D::ComputeFilletArc(const FVector2D& CornerPoint, const FVector2D& DirAwayFromCornerA, const FVector2D& DirAwayFromCornerB, float Radius, TArray<FVector2D>& OutArcPoints, int32 ArcSegments)
+bool FlexGeometry2D::ComputeFilletCenterAndSweep(const FVector2D& CornerPoint, const FVector2D& DirAwayFromCornerA, const FVector2D& DirAwayFromCornerB, float Radius, FVector2D& OutCenter, float& OutStartAngle, float& OutSweepAngle)
 {
-	OutArcPoints.Reset();
-
 	const FVector2D UA = DirAwayFromCornerA.GetSafeNormal();
 	const FVector2D UB = DirAwayFromCornerB.GetSafeNormal();
 	if (UA.IsNearlyZero() || UB.IsNearlyZero())
@@ -81,20 +79,73 @@ bool FlexGeometry2D::ComputeFilletArc(const FVector2D& CornerPoint, const FVecto
 	const FVector2D TangentA = CornerPoint + UA * TangentDist;
 	const FVector2D TangentB = CornerPoint + UB * TangentDist;
 	const FVector2D Bisector = (UA + UB).GetSafeNormal();
-	const FVector2D Center = CornerPoint + Bisector * CenterDist;
+	OutCenter = CornerPoint + Bisector * CenterDist;
 
-	const float AngleA = FMath::Atan2(TangentA.Y - Center.Y, TangentA.X - Center.X);
-	const float AngleB = FMath::Atan2(TangentB.Y - Center.Y, TangentB.X - Center.X);
-	const float Delta = FMath::FindDeltaAngleRadians(AngleA, AngleB);
+	const float AngleA = FMath::Atan2(TangentA.Y - OutCenter.Y, TangentA.X - OutCenter.X);
+	const float AngleB = FMath::Atan2(TangentB.Y - OutCenter.Y, TangentB.X - OutCenter.X);
 
+	OutStartAngle = AngleA;
+	OutSweepAngle = FMath::FindDeltaAngleRadians(AngleA, AngleB);
+	return true;
+}
+
+void FlexGeometry2D::SampleArc(const FVector2D& Center, float StartAngle, float SweepAngle, float Radius, int32 ArcSegments, TArray<FVector2D>& OutPoints)
+{
+	OutPoints.Reset();
 	ArcSegments = FMath::Max(ArcSegments, 1);
-	OutArcPoints.Reserve(ArcSegments + 1);
+	OutPoints.Reserve(ArcSegments + 1);
 	for (int32 i = 0; i <= ArcSegments; ++i)
 	{
 		const float Alpha = static_cast<float>(i) / static_cast<float>(ArcSegments);
-		const float Angle = AngleA + Delta * Alpha;
-		OutArcPoints.Add(Center + FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) * Radius);
+		const float Angle = StartAngle + SweepAngle * Alpha;
+		OutPoints.Add(Center + FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)) * Radius);
+	}
+}
+
+bool FlexGeometry2D::IsSimplePolygon(TArrayView<const FVector2D> Polygon)
+{
+	const int32 N = Polygon.Num();
+	if (N < 3)
+	{
+		return false;
 	}
 
+	for (int32 i = 0; i < N; ++i)
+	{
+		const int32 NextI = (i + 1) % N;
+		for (int32 j = i + 1; j < N; ++j)
+		{
+			const int32 NextJ = (j + 1) % N;
+			// Skip adjacent edges (they legitimately share an endpoint) and the wraparound pair
+			// where edge j's own next vertex is edge i's start.
+			if (j == i || j == NextI || NextJ == i)
+			{
+				continue;
+			}
+
+			FVector2D IntersectionPoint;
+			float AlphaA = 0.f, AlphaB = 0.f;
+			if (SegmentSegmentIntersection(Polygon[i], Polygon[NextI], Polygon[j], Polygon[NextJ], IntersectionPoint, AlphaA, AlphaB))
+			{
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+bool FlexGeometry2D::ComputeFilletArc(const FVector2D& CornerPoint, const FVector2D& DirAwayFromCornerA, const FVector2D& DirAwayFromCornerB, float Radius, TArray<FVector2D>& OutArcPoints, int32 ArcSegments)
+{
+	OutArcPoints.Reset();
+
+	FVector2D Center;
+	float StartAngle, SweepAngle;
+	if (!ComputeFilletCenterAndSweep(CornerPoint, DirAwayFromCornerA, DirAwayFromCornerB, Radius, Center, StartAngle, SweepAngle))
+	{
+		return false;
+	}
+
+	SampleArc(Center, StartAngle, SweepAngle, Radius, ArcSegments, OutArcPoints);
 	return true;
 }

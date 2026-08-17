@@ -63,4 +63,12 @@ FEdMode* FFlexNetworkEdModeToolkit::GetEditorMode() const
 	// FToolkitManager::RegisterNewToolkit call, which is what makes the panel tab appear) both
 	// depend on this resolving to a real mode instead of null.
 	//
-	// GetEditorModeManager() itself asserts IsHosted() -- this can get called (e.g. f
+	// GetEditorModeManager() itself asserts IsHosted() -- this can get called (e.g. from
+	// FModeToolkit's own bookkeeping) after the toolkit host has gone away during editor
+	// shutdown, so guard it explicitly rather than crashing on exit.
+	if (!IsHosted())
+	{
+		return nullptr;
+	}
+	return GetEditorModeManager().GetActiveMode(FlexNetworkEdModeId);
+}

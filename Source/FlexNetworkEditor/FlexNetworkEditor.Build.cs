@@ -32,7 +32,15 @@ public class FlexNetworkEditor : ModuleRules
 			// FEditorModeInfo/FToolkitManager live here, not in UnrealEd itself.
 			"EditorFramework",
 			// FlexNetworkCreateDefaultProfilesCommand.cpp saves the generated sample profile assets.
-			"AssetRegistry"
+			"AssetRegistry",
+			// Tests/FlexOsmEditorGenerateTest.cpp inspects UProceduralMeshComponent sections directly.
+			"ProceduralMeshComponent",
+			// Satellite/FlexSatelliteImagerySettings.h is a UDeveloperSettings.
+			"DeveloperSettings",
+			// Satellite/FlexSatelliteTileFetcher.cpp issues the LGL-BW WMS GetMap request and decodes
+			// its PNG response.
+			"HTTP",
+			"ImageWrapper"
 		});
 	}
 }

@@ -41,6 +41,30 @@ struct FLEXNETWORKRUNTIME_API FFlexMeshSectionData
 
 	bool IsEmpty() const { return Vertices.Num() == 0 || Triangles.Num() == 0; }
 
+	/** Appends a single triangle (CCW when viewed from the side Normal points to), with UVs and a shared per-vertex normal/tangent -- used for fan-triangulated shapes like a corner island. */
+	void AppendTriangle(const FVector& A, const FVector& B, const FVector& C, const FVector& Normal, const FVector& TangentDir, const FVector2D& UvA, const FVector2D& UvB, const FVector2D& UvC, const FColor& Color = FColor::White)
+	{
+		const int32 Base = Vertices.Num();
+		Vertices.Add(A);
+		Vertices.Add(B);
+		Vertices.Add(C);
+
+		for (int32 i = 0; i < 3; ++i)
+		{
+			Normals.Add(Normal);
+			Tangents.Add(FProcMeshTangent(TangentDir, false));
+			VertexColors.Add(Color);
+		}
+
+		UV0.Add(UvA);
+		UV0.Add(UvB);
+		UV0.Add(UvC);
+
+		Triangles.Add(Base + 0);
+		Triangles.Add(Base + 1);
+		Triangles.Add(Base + 2);
+	}
+
 	/** Appends a quad (four corners, CCW when viewed from the side Normal points to) as two triangles, with UVs and a shared per-vertex normal/tangent. */
 	void AppendQuad(const FVector& A, const FVector& B, const FVector& C, const FVector& D, const FVector& Normal, const FVector& TangentDir, const FVector2D& UvA, const FVector2D& UvB, const FVector2D& UvC, const FVector2D& UvD, const FColor& Color = FColor::White)
 	{
@@ -123,7 +147,7 @@ struct FLEXNETWORKRUNTIME_API FFlexSegmentMeshResult
 	float TrimEndArcLength = 0.f;
 };
 
-/** Everything derived from a node's junction: the visible surface polygon and crosswalk decal strips. */
+/** Everything derived from a node's junction: the visible drivable surface, crosswalk decal strips, and the rounded sidewalk-corner islands/bands that replace an abrupt sidewalk cutoff. */
 USTRUCT()
 struct FLEXNETWORKRUNTIME_API FFlexJunctionMeshResult
 {
@@ -134,4 +158,12 @@ struct FLEXNETWORKRUNTIME_API FFlexJunctionMeshResult
 
 	UPROPERTY()
 	FFlexMeshSectionData Crosswalks;
+
+	/** The curved sidewalk strip wrapped around each corner island's outside, connecting one approach's sidewalk to the next. */
+	UPROPERTY()
+	FFlexMeshSectionData SidewalkCorners;
+
+	/** The raised/landscaped corner refuge each SidewalkCorners band wraps around. */
+	UPROPERTY()
+	FFlexMeshSectionData CornerIslands;
 };

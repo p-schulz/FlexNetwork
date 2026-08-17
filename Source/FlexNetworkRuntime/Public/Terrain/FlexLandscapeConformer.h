@@ -27,6 +27,7 @@ class FLEXNETWORKRUNTIME_API FFlexLandscapeConformer : public IFlexTerrainConfor
 public:
 	virtual void ConformSegment(UWorld* World, FFlexSegmentId SegmentId, const TArray<FFlexCurveFrame>& Frames, float RoadHalfWidth, float Margin, float FalloffDistance) override;
 	virtual void RemoveSegmentConforming(UWorld* World, FFlexSegmentId SegmentId) override;
+	virtual bool SampleHeight(UWorld* World, const FVector2D& Location, float& OutHeight) const override;
 
 private:
 	struct FSavedHeightRegion

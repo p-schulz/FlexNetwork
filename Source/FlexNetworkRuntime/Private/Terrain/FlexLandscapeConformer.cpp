@@ -200,6 +200,44 @@ void FFlexLandscapeConformer::RemoveSegmentConforming(UWorld* World, FFlexSegmen
 	RestoreSavedRegion(World, SegmentId);
 }
 
+bool FFlexLandscapeConformer::SampleHeight(UWorld* World, const FVector2D& Location, float& OutHeight) const
+{
+	ALandscape* Landscape = FindLandscape(World);
+	if (!Landscape)
+	{
+		return false;
+	}
+	ULandscapeInfo* Info = Landscape->GetLandscapeInfo();
+	if (!Info)
+	{
+		return false;
+	}
+
+	const FTransform& LandscapeTransform = Landscape->GetActorTransform();
+	const FVector Local = LandscapeTransform.InverseTransformPosition(FVector(Location.X, Location.Y, 0.f));
+	const int32 X = FMath::RoundToInt32(Local.X);
+	const int32 Y = FMath::RoundToInt32(Local.Y);
+
+	int32 LandscapeMinX, LandscapeMinY, LandscapeMaxX, LandscapeMaxY;
+	if (!Info->GetLandscapeExtent(LandscapeMinX, LandscapeMinY, LandscapeMaxX, LandscapeMaxY))
+	{
+		return false;
+	}
+	if (X < LandscapeMinX || X > LandscapeMaxX || Y < LandscapeMinY || Y > LandscapeMaxY)
+	{
+		return false; // Location isn't over this landscape at all.
+	}
+
+	uint16 PackedHeight = 0;
+	FLandscapeEditDataInterface EditInterface(Info);
+	int32 X1 = X, Y1 = Y, X2 = X, Y2 = Y;
+	EditInterface.GetHeightData(X1, Y1, X2, Y2, &PackedHeight, 0);
+
+	const FVector WorldPos = LandscapeTransform.TransformPosition(FVector(static_cast<float>(X), static_cast<float>(Y), LandscapeDataAccess::GetLocalHeight(PackedHeight)));
+	OutHeight = WorldPos.Z;
+	return true;
+}
+
 #else // !WITH_EDITOR
 
 void FFlexLandscapeConformer::ConformSegment(UWorld* World, FFlexSegmentId SegmentId, const TArray<FFlexCurveFrame>& Frames, float RoadHalfWidth, float Margin, float FalloffDistance)
@@ -217,6 +255,11 @@ void FFlexLandscapeConformer::RemoveSegmentConforming(UWorld* World, FFlexSegmen
 
 void FFlexLandscapeConformer::RestoreSavedRegion(UWorld* World, FFlexSegmentId SegmentId)
 {
+}
+
+bool FFlexLandscapeConformer::SampleHeight(UWorld* World, const FVector2D& Location, float& OutHeight) const
+{
+	return false; // Same editor-time-only restriction as ConformSegment above.
 }
 
 #endif // WITH_EDITOR
