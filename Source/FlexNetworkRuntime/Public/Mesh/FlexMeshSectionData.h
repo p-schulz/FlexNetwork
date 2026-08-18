@@ -167,3 +167,27 @@ struct FLEXNETWORKRUNTIME_API FFlexJunctionMeshResult
 	UPROPERTY()
 	FFlexMeshSectionData CornerIslands;
 };
+
+/**
+ * Classic renderer output after all road and junction footprints have been boolean-unified.
+ * Sidewalks and curbs are deliberately derived from the exposed boundary of Roadway instead of
+ * being extruded independently by segments/junctions, which prevents either layer from entering
+ * a drivable surface when trims change.
+ */
+USTRUCT()
+struct FLEXNETWORKRUNTIME_API FFlexUnifiedNetworkMeshResult
+{
+	GENERATED_BODY()
+
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> Roadways;
+
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> Sidewalks;
+
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> Curbs;
+
+	/** Exposed unified curb-edge chords for the editor's optional static curbstone pass. */
+	TArray<TArray<FVector>> CurbLines;
+};

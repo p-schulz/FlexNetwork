@@ -63,9 +63,24 @@ namespace
 		for (const FVector& Vertex : Section.Vertices) OutMesh.AppendVertex(Vertex);
 		for (int32 Index = 0; Index + 2 < Section.Triangles.Num(); Index += 3)
 		{
-			const int32 A = Section.Triangles[Index], B = Section.Triangles[Index + 1], C = Section.Triangles[Index + 2];
+			const int32 A = Section.Triangles[Index];
+			int32 B = Section.Triangles[Index + 1];
+			int32 C = Section.Triangles[Index + 2];
 			if (OutMesh.IsVertex(A) && OutMesh.IsVertex(B) && OutMesh.IsVertex(C) && A != B && B != C && A != C)
 			{
+				// FDynamicMesh3 follows the geometric convention: triangle winding must point in
+				// the same direction as its shading normal. FlexNetwork's ProceduralMesh sections
+				// use the opposite rasterizer convention, so copying their indices verbatim can
+				// alternate front/back-facing triangles along a sidewalk strip.
+				if (Section.Normals.IsValidIndex(A) && Section.Normals.IsValidIndex(B) && Section.Normals.IsValidIndex(C))
+				{
+					const FVector DesiredNormal = (Section.Normals[A] + Section.Normals[B] + Section.Normals[C]).GetSafeNormal();
+					const FVector GeometricNormal = FVector::CrossProduct(Section.Vertices[B] - Section.Vertices[A], Section.Vertices[C] - Section.Vertices[A]);
+					if (!DesiredNormal.IsNearlyZero() && FVector::DotProduct(GeometricNormal, DesiredNormal) < 0.f)
+					{
+						Swap(B, C);
+					}
+				}
 				const int32 TriangleId = OutMesh.AppendTriangle(A, B, C);
 				if (TriangleId >= 0)
 				{

@@ -27,7 +27,9 @@ public class FlexNetworkRuntime : ModuleRules
 		PrivateDependencyModuleNames.AddRange(new[]
 		{
 			"RenderCore",
-			"Landscape"
+			"Landscape",
+			"GeometryCore",
+			"GeometryAlgorithms"
 		});
 
 		if (Target.bBuildEditor)

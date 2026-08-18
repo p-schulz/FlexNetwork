@@ -6,9 +6,9 @@
 #include "Math/FlexBezierMath.h"
 #include "Math/FlexGeometry2D.h"
 #include "Mesh/FlexRoadMeshBuilder.h"
+#include "Mesh/FlexUnifiedRoadMeshBuilder.h"
 #include "Intersection/FlexIntersectionBuilder.h"
 #include "Terrain/FlexLandscapeConformer.h"
-#include "Async/ParallelFor.h"
 #include "Engine/World.h"
 
 namespace
@@ -42,6 +42,104 @@ namespace
 			Segment.Curve.P1.Z = Z0;
 			Segment.Curve.P2.Z = Z3;
 			break;
+		}
+	}
+
+	TArray<FVector> BuildRoadFootprint(const TArray<FFlexCurveFrame>& Frames, float HalfWidth)
+	{
+		TArray<FVector> Boundary;
+		if (Frames.Num() < 2 || HalfWidth <= KINDA_SMALL_NUMBER)
+		{
+			return Boundary;
+		}
+		Boundary.Reserve(Frames.Num() * 2);
+		for (const FFlexCurveFrame& Frame : Frames)
+		{
+			Boundary.Add(Frame.Position - Frame.Right * HalfWidth);
+		}
+		for (int32 Index = Frames.Num() - 1; Index >= 0; --Index)
+		{
+			Boundary.Add(Frames[Index].Position + Frames[Index].Right * HalfWidth);
+		}
+		return Boundary;
+	}
+
+	void GetLaneRolesForNode(const FRoadLaneDescriptor& Lane, bool bNodeIsSegmentEnd, bool& bOutIncoming, bool& bOutOutgoing)
+	{
+		bOutIncoming = false;
+		bOutOutgoing = false;
+		if (!Lane.IsDrivable())
+		{
+			return;
+		}
+		switch (Lane.Direction)
+		{
+		case EFlexLaneDirection::Forward:
+			bOutIncoming = bNodeIsSegmentEnd;
+			bOutOutgoing = !bNodeIsSegmentEnd;
+			break;
+		case EFlexLaneDirection::Backward:
+			bOutIncoming = !bNodeIsSegmentEnd;
+			bOutOutgoing = bNodeIsSegmentEnd;
+			break;
+		case EFlexLaneDirection::Bidirectional:
+			bOutIncoming = true;
+			bOutOutgoing = true;
+			break;
+		default:
+			break;
+		}
+	}
+
+	void ValidateLaneConnectivity(FFlexNodeId NodeId, TConstArrayView<FFlexJunctionApproachInput> Approaches, const FFlexJunctionData& Junction)
+	{
+		for (const FFlexJunctionApproachInput& From : Approaches)
+		{
+			if (!From.Profile)
+			{
+				continue;
+			}
+			for (int32 FromLaneIndex = 0; FromLaneIndex < From.Profile->Lanes.Num(); ++FromLaneIndex)
+			{
+				bool bIncoming = false, bOutgoing = false;
+				GetLaneRolesForNode(From.Profile->Lanes[FromLaneIndex], From.bNodeIsSegmentEnd, bIncoming, bOutgoing);
+				if (!bIncoming)
+				{
+					continue;
+				}
+
+				for (const FFlexJunctionApproachInput& To : Approaches)
+				{
+					if (To.SegmentId == From.SegmentId || !To.Profile)
+					{
+						continue;
+					}
+					const bool bHasOutgoing = To.Profile->Lanes.ContainsByPredicate([&](const FRoadLaneDescriptor& Lane)
+					{
+						bool bToIncoming = false, bToOutgoing = false;
+						GetLaneRolesForNode(Lane, To.bNodeIsSegmentEnd, bToIncoming, bToOutgoing);
+						return bToOutgoing;
+					});
+					if (!bHasOutgoing)
+					{
+						continue;
+					}
+
+					const bool bConnected = Junction.LaneConnectors.ContainsByPredicate([&](const FFlexLaneConnector& Connector)
+					{
+						return Connector.FromSegment == From.SegmentId
+							&& Connector.FromLaneIndex == FromLaneIndex
+							&& Connector.ToSegment == To.SegmentId;
+					});
+					if (!bConnected)
+					{
+						UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: junction %u:%u has no legal connector from road %u:%u lane %d to neighbouring road %u:%u."),
+							NodeId.Index, NodeId.Generation,
+							From.SegmentId.Index, From.SegmentId.Generation, FromLaneIndex,
+							To.SegmentId.Index, To.SegmentId.Generation);
+					}
+				}
+			}
 		}
 	}
 }
@@ -852,6 +950,125 @@ bool UFlexNetworkSubsystem::BuildJunctionMeshResult(FFlexNodeId NodeId, FFlexJun
 	return !OutResult.Surface.IsEmpty() || !OutResult.SidewalkCorners.IsEmpty();
 }
 
+FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResult() const
+{
+	TArray<FFlexUnifiedRoadPolygonInput> SurfaceInputs;
+	TArray<FFlexUnifiedRoadSuppressionInput> SuppressionInputs;
+	const UFlexNetworkSettings* Settings = GetSettings();
+
+	// Start with the current angle-trimmed segment strips. A short segment whose two junction
+	// trims leave too little usable roadside is deliberately bridged at full length; its expanded
+	// footprint is also supplied as a sidewalk/curb suppression region below.
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexSegmentId SegmentId = Pair.Key;
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+
+		const float SegmentLength = Segment.GetLength();
+		float RawTrimStart = 0.f;
+		float RawTrimEnd = SegmentLength;
+		const FFlexJunctionData* StartJunction = JunctionDataByNode.Find(Segment.StartNodeId);
+		const FFlexJunctionData* EndJunction = JunctionDataByNode.Find(Segment.EndNodeId);
+		if (StartJunction)
+		{
+			if (const float* Trim = StartJunction->TrimArcLengthBySegment.Find(SegmentId))
+			{
+				RawTrimStart = FMath::Clamp(*Trim, 0.f, SegmentLength);
+			}
+		}
+		if (EndJunction)
+		{
+			if (const float* Trim = EndJunction->TrimArcLengthBySegment.Find(SegmentId))
+			{
+				RawTrimEnd = FMath::Clamp(*Trim, 0.f, SegmentLength);
+			}
+		}
+
+		const float AvailableRoadsideLength = FMath::Max(0.f, RawTrimEnd - RawTrimStart);
+		const float RequiredRoadsideLength = FMath::Max(Settings->CloseJunctionRoadsideClearance, Segment.Profile->SidewalkWidth * 2.f);
+		const bool bCloseJunctionBridge = StartJunction && EndJunction && AvailableRoadsideLength < RequiredRoadsideLength;
+		const float SurfaceStart = bCloseJunctionBridge ? 0.f : RawTrimStart;
+		const float SurfaceEnd = bCloseJunctionBridge ? SegmentLength : FMath::Max(RawTrimStart, RawTrimEnd);
+		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
+		const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(
+			Segment.Curve, Segment.ArcLengthTable, ReferenceUp, Settings->ArcLengthSampleStep, SurfaceStart, SurfaceEnd);
+
+		FFlexUnifiedRoadPolygonInput Surface;
+		Surface.Boundary = BuildRoadFootprint(Frames, Segment.Profile->GetRoadwayHalfWidth());
+		Surface.ElevationLayer = static_cast<int32>(Segment.ElevationType);
+		Surface.SidewalkWidth = Segment.Profile->SidewalkWidth;
+		Surface.CurbHeight = Segment.Profile->CurbHeight;
+		Surface.RoadMaterial = Segment.Profile->RoadMaterial;
+		Surface.SidewalkMaterial = Segment.Profile->SidewalkMaterial;
+		Surface.CurbMaterial = Segment.Profile->CurbMaterial ? Segment.Profile->CurbMaterial.Get() : Segment.Profile->SidewalkMaterial.Get();
+		if (Surface.Boundary.Num() >= 3)
+		{
+			SurfaceInputs.Add(MoveTemp(Surface));
+		}
+
+		if (bCloseJunctionBridge)
+		{
+			// Keep the curb-line strictly inside the suppression polygon even for profiles whose
+			// sidewalk width is zero; containment on a coincident polygon edge is intentionally
+			// undefined in the boolean library.
+			const float SuppressionHalfWidth = Segment.Profile->GetRoadwayHalfWidth() + FMath::Max(Segment.Profile->SidewalkWidth, 50.f);
+			FFlexUnifiedRoadSuppressionInput Suppression;
+			Suppression.Boundary = BuildRoadFootprint(Frames, SuppressionHalfWidth);
+			Suppression.ElevationLayer = static_cast<int32>(Segment.ElevationType);
+			if (Suppression.Boundary.Num() >= 3)
+			{
+				SuppressionInputs.Add(MoveTemp(Suppression));
+			}
+		}
+	}
+
+	// Junction surfaces use the same boolean input as road strips. Their angle-dependent trim
+	// polygons therefore replace, rather than overlap, the road ends and are automatically merged
+	// with close neighbouring junctions through the bridge strip above.
+	for (const TPair<FFlexNodeId, FFlexJunctionData>& Pair : JunctionDataByNode)
+	{
+		const FFlexRoadNode* Node = Nodes.Find(Pair.Key);
+		if (!Node || Pair.Value.PolygonBoundary.Num() < 3)
+		{
+			continue;
+		}
+
+		const FFlexRoadSegment* MaterialSegment = nullptr;
+		for (const FFlexSegmentId SegmentId : Node->ConnectedSegments)
+		{
+			if (const FFlexRoadSegment* Candidate = Segments.Find(SegmentId); Candidate && Candidate->Profile)
+			{
+				MaterialSegment = Candidate;
+				break;
+			}
+		}
+		if (!MaterialSegment || !MaterialSegment->Profile)
+		{
+			continue;
+		}
+
+		FFlexUnifiedRoadPolygonInput Surface;
+		Surface.Boundary = Pair.Value.PolygonBoundary;
+		Surface.ElevationLayer = static_cast<int32>(MaterialSegment->ElevationType);
+		Surface.SidewalkWidth = MaterialSegment->Profile->SidewalkWidth;
+		Surface.CurbHeight = MaterialSegment->Profile->CurbHeight;
+		Surface.RoadMaterial = MaterialSegment->Profile->JunctionMaterial
+			? MaterialSegment->Profile->JunctionMaterial.Get()
+			: MaterialSegment->Profile->RoadMaterial.Get();
+		Surface.SidewalkMaterial = MaterialSegment->Profile->SidewalkMaterial;
+		Surface.CurbMaterial = MaterialSegment->Profile->CurbMaterial
+			? MaterialSegment->Profile->CurbMaterial.Get()
+			: MaterialSegment->Profile->SidewalkMaterial.Get();
+		SurfaceInputs.Add(MoveTemp(Surface));
+	}
+
+	return FFlexUnifiedRoadMeshBuilder::Build(SurfaceInputs, SuppressionInputs);
+}
+
 FFlexCurveFrame UFlexNetworkSubsystem::SampleSegmentAtArcLength(FFlexSegmentId SegmentId, float ArcLength) const
 {
 	const FFlexRoadSegment* Segment = Segments.Find(SegmentId);
@@ -1027,6 +1244,7 @@ void UFlexNetworkSubsystem::RebuildDirty()
 
 			const float FilletRadius = Node->FilletRadiusOverride > 0.f ? Node->FilletRadiusOverride : Settings->DefaultFilletRadius;
 			FFlexJunctionData JunctionData = FFlexIntersectionBuilder::BuildJunction(Node->Position, Node->UpVector, Approaches, FilletRadius, Settings->CrosswalkWidth, Settings->CrosswalkMinClearance, Settings->CurbReturnRadius, Settings->ParallelApproachAngleToleranceDegrees, 8, Settings->CurbReturnArcSegments);
+			ValidateLaneConnectivity(NodeId, Approaches, JunctionData);
 
 			for (const TPair<FFlexSegmentId, float>& TrimPair : JunctionData.TrimArcLengthBySegment)
 			{
@@ -1070,33 +1288,12 @@ void UFlexNetworkSubsystem::RebuildDirty()
 		}
 	}
 
-	// 5. Build + apply segment meshes. Building is pure per-segment work (no shared mutable
-	// state), so it's safe to parallelize across worker threads once the batch is big enough
-	// that ParallelFor's dispatch overhead is worth it; applying to components/terrain happens
-	// back on the game thread afterward, same as UProceduralMeshComponent/Landscape require.
+	// 5. Segment actors and terrain remain incremental. Classic geometry is rebuilt as one
+	// topology-first surface after this loop because a changed road can alter exposed boundary
+	// edges beyond the component that originally owned them.
 	TArray<FFlexSegmentId> SegmentIdsToRebuild = FinalDirtySegments.Array();
 	const bool bGenerateGeometry = VisualizationMode != EFlexNetworkVisualizationMode::SegmentActors;
 	const bool bGenerateSegmentActors = VisualizationMode != EFlexNetworkVisualizationMode::GeneratedGeometry;
-	TArray<FFlexSegmentMeshResult> MeshResults;
-	if (bGenerateGeometry) MeshResults.SetNum(SegmentIdsToRebuild.Num());
-
-	const bool bParallel = SegmentIdsToRebuild.Num() >= Settings->ParallelRebuildThreshold;
-	if (bGenerateGeometry) ParallelFor(SegmentIdsToRebuild.Num(), [this, &SegmentIdsToRebuild, &MeshResults, &TrimRangeBySegment, Settings](int32 Index)
-	{
-		const FFlexSegmentId SegId = SegmentIdsToRebuild[Index];
-		const FFlexRoadSegment* Segment = Segments.Find(SegId);
-		if (!Segment || !Segment->Profile)
-		{
-			return;
-		}
-
-		const FVector RefUp = Nodes.Contains(Segment->StartNodeId) ? Nodes.FindChecked(Segment->StartNodeId).UpVector : FVector::UpVector;
-		const TPair<float, float>* Range = TrimRangeBySegment.Find(SegId);
-		const float TrimStart = Range ? Range->Key : 0.f;
-		const float TrimEnd = Range ? Range->Value : Segment->GetLength();
-
-		MeshResults[Index] = FFlexRoadMeshBuilder::BuildSegmentMesh(Segment->Curve, Segment->ArcLengthTable, Segment->Profile, RefUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
-	}, bParallel ? EParallelForFlags::None : EParallelForFlags::ForceSingleThread);
 
 	AFlexNetworkMeshActor* Actor = bGenerateGeometry ? GetOrCreateMeshActor() : nullptr;
 	UWorld* World = GetWorld();
@@ -1109,10 +1306,6 @@ void UFlexNetworkSubsystem::RebuildDirty()
 			continue;
 		}
 
-		if (Actor)
-		{
-			Actor->ApplySegmentMesh(SegId, MeshResults[Index]);
-		}
 		if (bGenerateSegmentActors)
 		{
 			if (AFlexNetworkSegmentActor* SegmentActor = GetOrCreateSegmentActor(SegId))
@@ -1140,44 +1333,46 @@ void UFlexNetworkSubsystem::RebuildDirty()
 		}
 	}
 
-	// 6. Junction meshes.
-	for (FFlexNodeId NodeId : AffectedNodes)
+	if (Actor)
 	{
-		const FFlexRoadNode* Node = Nodes.Find(NodeId);
-		if (!Node)
-		{
-			continue; // Node itself may have been removed as part of this batch.
-		}
+		Actor->ApplyUnifiedNetworkMesh(BuildUnifiedClassicMeshResult());
+	}
 
-		if (bGenerateGeometry)
+	// 6. The unified result owns road, junction, sidewalk and curb surfaces. Junction components
+	// now carry crosswalk overlays only; rebuild every cached overlay because applying the unified
+	// surface intentionally clears all legacy independently-generated junction surface sections.
+	if (bGenerateGeometry)
+	{
+		for (const TPair<FFlexNodeId, FFlexJunctionData>& Pair : JunctionDataByNode)
 		{
-		 if (const FFlexJunctionData* JunctionData = JunctionDataByNode.Find(NodeId))
-		 {
-			UMaterialInterface* SurfaceMaterial = nullptr;
+			const FFlexNodeId NodeId = Pair.Key;
+			const FFlexRoadNode* Node = Nodes.Find(NodeId);
+			if (!Node)
+			{
+				continue;
+			}
 			UMaterialInterface* CrosswalkMaterial = nullptr;
-			UMaterialInterface* SidewalkMaterial = nullptr;
-			UMaterialInterface* MedianMaterial = nullptr;
 			if (Node->ConnectedSegments.Num() > 0)
 			{
 				if (const FFlexRoadSegment* FirstSegment = Segments.Find(Node->ConnectedSegments[0]))
 				{
 					if (FirstSegment->Profile)
 					{
-						SurfaceMaterial = FirstSegment->Profile->JunctionMaterial;
 						CrosswalkMaterial = FirstSegment->Profile->CrosswalkMaterial
 							? FirstSegment->Profile->CrosswalkMaterial.Get()
 							: FirstSegment->Profile->SidewalkMaterial.Get();
-						SidewalkMaterial = FirstSegment->Profile->SidewalkMaterial;
-						MedianMaterial = FirstSegment->Profile->MedianMaterial;
 					}
 				}
 			}
-			const FFlexJunctionMeshResult JunctionMesh = FFlexIntersectionBuilder::BuildJunctionMesh(Node->UpVector, *JunctionData, SurfaceMaterial, CrosswalkMaterial, SidewalkMaterial, MedianMaterial);
+			FFlexJunctionMeshResult JunctionMesh = FFlexIntersectionBuilder::BuildJunctionMesh(
+				Node->UpVector, Pair.Value, nullptr, CrosswalkMaterial, nullptr, nullptr);
+			JunctionMesh.Surface = FFlexMeshSectionData();
+			JunctionMesh.SidewalkCorners = FFlexMeshSectionData();
+			JunctionMesh.CornerIslands = FFlexMeshSectionData();
 			if (Actor)
 			{
 				Actor->ApplyJunctionMesh(NodeId, JunctionMesh);
 			}
-		 }
 		}
 	}
 

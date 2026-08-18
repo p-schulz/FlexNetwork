@@ -106,6 +106,10 @@ namespace FFlexOsmGraphBuilder
 	 * a typical implementation checks a cache by Signature.ToKey(), and on a miss creates a new
 	 * URoadTypeProfile, calls ConfigureProfileFromLaneSignature on it, persists it however the
 	 * caller sees fit, and caches it for subsequent calls with the same key.
+	 *
+	 * All graph mutations are wrapped in one nestable subsystem batch. A direct runtime call
+	 * validates/rebuilds once after the last segment; a caller may add an outer batch to combine
+	 * adjacent state changes (the editor does this for its visualization-mode selection).
 	 */
 	FLEXNETWORKRUNTIME_API FImportResult BuildFromOsm(UFlexNetworkSubsystem& Subsystem, const UOsmDataAsset& OsmAsset, const FFlexOsmImportSettings& Settings, TFunctionRef<URoadTypeProfile*(const FLaneSignature&)> ResolveProfile);
 }

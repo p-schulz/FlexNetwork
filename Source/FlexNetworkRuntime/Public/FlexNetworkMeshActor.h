@@ -11,11 +11,11 @@ class USplineMeshComponent;
 class UStaticMesh;
 
 /**
- * Hosts the generated UProceduralMeshComponents for one FlexNetwork graph: one component per
- * segment (section 0 = roadway, section 1 = sidewalks) and one per junction (section 0 =
- * surface, section 1 = crosswalks, section 2 = sidewalk corner bands, section 3 = landscaped
- * corner islands). UWorldSubsystem can't own components directly, so UFlexNetworkSubsystem
- * lazily spawns and drives one of these per world instead.
+ * Hosts generated classic geometry for one FlexNetwork graph. The current renderer uses one
+ * topology-first component with material-partitioned roadway, sidewalk and curb sections, plus
+ * small per-junction components for crosswalk overlays. The per-segment API remains available for
+ * callers that explicitly request a standalone mesh result, but normal subsystem rebuilds replace
+ * those components with the unified representation.
  */
 UCLASS(NotBlueprintable)
 class FLEXNETWORKRUNTIME_API AFlexNetworkMeshActor : public AActor
@@ -30,6 +30,10 @@ public:
 
 	void ApplyJunctionMesh(FFlexNodeId NodeId, const FFlexJunctionMeshResult& MeshResult);
 	void RemoveJunctionMesh(FFlexNodeId NodeId);
+
+	/** Replaces the classic topology-first roadway, sidewalk, and curb sections. */
+	void ApplyUnifiedNetworkMesh(const FFlexUnifiedNetworkMeshResult& MeshResult);
+	const TArray<TArray<FVector>>& GetUnifiedCurbLines() const { return UnifiedCurbLines; }
 
 	/**
 	 * Replaces every previously-generated curbstone with a fresh set: for each entry in CurbLines
@@ -50,6 +54,11 @@ private:
 
 	UPROPERTY()
 	TMap<FFlexNodeId, TObjectPtr<UProceduralMeshComponent>> JunctionComponents;
+
+	UPROPERTY()
+	TObjectPtr<UProceduralMeshComponent> UnifiedNetworkComponent;
+
+	TArray<TArray<FVector>> UnifiedCurbLines;
 
 	UPROPERTY()
 	TArray<TObjectPtr<USplineMeshComponent>> CurbstoneComponents;

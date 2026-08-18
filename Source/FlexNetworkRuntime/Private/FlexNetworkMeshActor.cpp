@@ -70,10 +70,34 @@ void AFlexNetworkMeshActor::ApplySectionData(UProceduralMeshComponent* Comp, int
 		return;
 	}
 
+	// FlexNetwork's procedural sections use the same convention as the existing junction builder:
+	// a visible face has geometric winding opposite its supplied shading normal. Boolean/Delaunay
+	// triangulators are free to return either orientation per triangle, so normalize here at the
+	// renderer boundary. Without this, a strip can render exactly one triangle from each quad and
+	// leave the alternating saw-tooth holes visible along its outer edge.
+	TArray<int32> NormalizedTriangles = Data.Triangles;
+	for (int32 TriangleIndex = 0; TriangleIndex + 2 < NormalizedTriangles.Num(); TriangleIndex += 3)
+	{
+		const int32 A = NormalizedTriangles[TriangleIndex];
+		const int32 B = NormalizedTriangles[TriangleIndex + 1];
+		const int32 C = NormalizedTriangles[TriangleIndex + 2];
+		if (!Data.Vertices.IsValidIndex(A) || !Data.Vertices.IsValidIndex(B) || !Data.Vertices.IsValidIndex(C)
+			|| !Data.Normals.IsValidIndex(A) || !Data.Normals.IsValidIndex(B) || !Data.Normals.IsValidIndex(C))
+		{
+			continue;
+		}
+		const FVector DesiredNormal = (Data.Normals[A] + Data.Normals[B] + Data.Normals[C]).GetSafeNormal();
+		const FVector GeometricNormal = FVector::CrossProduct(Data.Vertices[B] - Data.Vertices[A], Data.Vertices[C] - Data.Vertices[A]);
+		if (!DesiredNormal.IsNearlyZero() && FVector::DotProduct(GeometricNormal, DesiredNormal) > 0.f)
+		{
+			Swap(NormalizedTriangles[TriangleIndex + 1], NormalizedTriangles[TriangleIndex + 2]);
+		}
+	}
+
 	Comp->CreateMeshSection(
 		SectionIndex,
 		Data.Vertices,
-		Data.Triangles,
+		NormalizedTriangles,
 		Data.Normals,
 		Data.UV0,
 		TArray<FVector2D>(),
@@ -83,10 +107,9 @@ void AFlexNetworkMeshActor::ApplySectionData(UProceduralMeshComponent* Comp, int
 		Data.Tangents,
 		Data.bEnableCollision);
 
-	if (Data.Material)
-	{
-		Comp->SetMaterial(SectionIndex, Data.Material);
-	}
+	// Set null as well: section indices are reassigned when material groups change, so retaining
+	// an older slot material would incorrectly skin a newly-created unified section.
+	Comp->SetMaterial(SectionIndex, Data.Material);
 }
 
 void AFlexNetworkMeshActor::ApplySegmentMesh(FFlexSegmentId SegmentId, const FFlexSegmentMeshResult& MeshResult)
@@ -118,6 +141,64 @@ void AFlexNetworkMeshActor::RemoveJunctionMesh(FFlexNodeId NodeId)
 	if (TObjectPtr<UProceduralMeshComponent> Comp; JunctionComponents.RemoveAndCopyValue(NodeId, Comp) && Comp)
 	{
 		Comp->DestroyComponent();
+	}
+}
+
+void AFlexNetworkMeshActor::ApplyUnifiedNetworkMesh(const FFlexUnifiedNetworkMeshResult& MeshResult)
+{
+	UnifiedCurbLines = MeshResult.CurbLines;
+	// The topology-first renderer supersedes the old per-segment road/sidewalk components.
+	for (const TPair<FFlexSegmentId, TObjectPtr<UProceduralMeshComponent>>& Pair : SegmentComponents)
+	{
+		if (Pair.Value)
+		{
+			Pair.Value->DestroyComponent();
+		}
+	}
+	SegmentComponents.Reset();
+	for (USplineMeshComponent* Comp : CurbstoneComponents)
+	{
+		if (Comp)
+		{
+			Comp->DestroyComponent();
+		}
+	}
+	CurbstoneComponents.Reset();
+
+	// Junction components remain useful for crosswalk overlays, but their old surface and
+	// independently-generated roadside layers must not overlap the unified result.
+	for (const TPair<FFlexNodeId, TObjectPtr<UProceduralMeshComponent>>& Pair : JunctionComponents)
+	{
+		if (Pair.Value)
+		{
+			Pair.Value->ClearMeshSection(kJunctionSurfaceSection);
+			Pair.Value->ClearMeshSection(kJunctionSidewalkCornerSection);
+			Pair.Value->ClearMeshSection(kJunctionCornerIslandSection);
+		}
+	}
+
+	if (!UnifiedNetworkComponent)
+	{
+		UnifiedNetworkComponent = NewObject<UProceduralMeshComponent>(this, TEXT("UnifiedNetwork"));
+		UnifiedNetworkComponent->SetupAttachment(RootSceneComponent);
+		UnifiedNetworkComponent->RegisterComponent();
+		UnifiedNetworkComponent->SetMobility(EComponentMobility::Movable);
+		UnifiedNetworkComponent->SetRelativeLocation(FVector(0.f, 0.f, GetDefault<UFlexNetworkSettings>()->MeshZFightOffset));
+	}
+
+	UnifiedNetworkComponent->ClearAllMeshSections();
+	int32 SectionIndex = 0;
+	for (const FFlexMeshSectionData& Section : MeshResult.Roadways)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
+	for (const FFlexMeshSectionData& Section : MeshResult.Sidewalks)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
+	for (const FFlexMeshSectionData& Section : MeshResult.Curbs)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
 	}
 }
 
@@ -168,6 +249,13 @@ void AFlexNetworkMeshActor::ApplyCurbstones(const TArray<TArray<FVector>>& CurbL
 
 void AFlexNetworkMeshActor::ClearAll()
 {
+	if (UnifiedNetworkComponent)
+	{
+		UnifiedNetworkComponent->DestroyComponent();
+		UnifiedNetworkComponent = nullptr;
+	}
+	UnifiedCurbLines.Reset();
+
 	for (const TPair<FFlexSegmentId, TObjectPtr<UProceduralMeshComponent>>& Pair : SegmentComponents)
 	{
 		if (Pair.Value)

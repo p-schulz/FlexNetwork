@@ -16,6 +16,7 @@ class AFlexNetworkSegmentActor;
 class UFlexNetworkSettings;
 struct FFlexSegmentMeshResult;
 struct FFlexJunctionMeshResult;
+struct FFlexUnifiedNetworkMeshResult;
 
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnRoadNetworkChangedNative, const TArray<FFlexNodeId>& /*ChangedNodes*/, const TArray<FFlexSegmentId>& /*ChangedSegments*/);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRoadNetworkChangedDynamic, const TArray<FFlexNodeId>&, ChangedNodes, const TArray<FFlexSegmentId>&, ChangedSegments);
@@ -216,8 +217,14 @@ private:
 
 	void DetachSegmentFromNode(FFlexNodeId NodeId, FFlexSegmentId SegmentId);
 
-	/** Recomputes arc-length tables, junction polygons/lane-connectors, meshes, and terrain conforming for everything touched since the last call, then fires OnRoadNetworkChanged. This is the one place all of that happens -- every mutation method above ends by calling it. */
+	/**
+	 * Recomputes arc-length tables, junction polygons/lane-connectors and terrain conforming for
+	 * everything touched since the last call. Classic rendering then rebuilds its unified footprint
+	 * globally because exposed boundary ownership can change across former component boundaries;
+	 * segment actors/PCG sources remain incremental. Every mutation method above ends here.
+	 */
 	void RebuildDirty();
+	FFlexUnifiedNetworkMeshResult BuildUnifiedClassicMeshResult() const;
 
 	TArray<struct FFlexJunctionApproachInput> BuildApproachInputs(FFlexNodeId NodeId) const;
 };

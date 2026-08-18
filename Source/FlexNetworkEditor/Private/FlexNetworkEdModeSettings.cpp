@@ -3,15 +3,14 @@
 #include "Osm/FlexOsmGraphBuilder.h"
 #include "FlexNetworkSubsystem.h"
 #include "FlexNetworkAssetUtils.h"
-#include "FlexNetworkSettings.h"
 #include "FlexNetworkMeshActor.h"
 #include "RoadTypeProfile.h"
-#include "Mesh/FlexRoadMeshBuilder.h"
 #include "Satellite/FlexSatelliteImagerySettings.h"
 #include "Satellite/FlexSatelliteImport.h"
 #include "Satellite/FlexSatelliteTileActor.h"
 #include "Satellite/FlexSatelliteImageBaker.h"
 #include "ScopedTransaction.h"
+#include "Misc/ScopeExit.h"
 #include "Engine/World.h"
 #include "Engine/Texture2D.h"
 #include "Materials/MaterialInterface.h"
@@ -48,8 +47,6 @@ void UFlexNetworkEdModeSettings::GenerateRoadsFromOsm()
 		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: UFlexNetworkSubsystem not available on this world."));
 		return;
 	}
-	Subsystem->SetVisualizationMode(VisualizationMode);
-
 	if (!OsmAsset)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: set an OSM Asset before generating roads."));
@@ -64,26 +61,38 @@ void UFlexNetworkEdModeSettings::GenerateRoadsFromOsm()
 	// already generated earlier in the same import).
 	TMap<FString, URoadTypeProfile*> ProfileCache;
 
-	const FFlexOsmGraphBuilder::FImportResult Result = FFlexOsmGraphBuilder::BuildFromOsm(*Subsystem, *OsmAsset, OsmImportSettings,
-		[&ProfileCache](const FFlexOsmGraphBuilder::FLaneSignature& Signature) -> URoadTypeProfile*
+	FFlexOsmGraphBuilder::FImportResult Result;
+	{
+		// SetVisualizationMode can itself dirty every existing graph item. Keep it in the same
+		// outer batch as the OSM mutations so a mode switch cannot cause a pre-import rebuild.
+		Subsystem->BeginBatchUpdate();
+		ON_SCOPE_EXIT
 		{
-			const FString Key = Signature.ToKey();
-			if (URoadTypeProfile** Existing = ProfileCache.Find(Key))
-			{
-				return *Existing;
-			}
+			Subsystem->EndBatchUpdate();
+		};
 
-			URoadTypeProfile* NewProfile = FlexNetworkAssetUtils::CreateRoadTypeProfileAsset(
-				TEXT("/FlexNetwork/Profiles/OSM"),
-				TEXT("DA_OSM_") + Key,
-				[&Signature](URoadTypeProfile& Profile) { FFlexOsmGraphBuilder::ConfigureProfileFromLaneSignature(Profile, Signature); });
-
-			if (NewProfile)
+		Subsystem->SetVisualizationMode(VisualizationMode);
+		Result = FFlexOsmGraphBuilder::BuildFromOsm(*Subsystem, *OsmAsset, OsmImportSettings,
+			[&ProfileCache](const FFlexOsmGraphBuilder::FLaneSignature& Signature) -> URoadTypeProfile*
 			{
-				ProfileCache.Add(Key, NewProfile);
-			}
-			return NewProfile;
-		});
+				const FString Key = Signature.ToKey();
+				if (URoadTypeProfile** Existing = ProfileCache.Find(Key))
+				{
+					return *Existing;
+				}
+
+				URoadTypeProfile* NewProfile = FlexNetworkAssetUtils::CreateRoadTypeProfileAsset(
+					TEXT("/FlexNetwork/Profiles/OSM"),
+					TEXT("DA_OSM_") + Key,
+					[&Signature](URoadTypeProfile& Profile) { FFlexOsmGraphBuilder::ConfigureProfileFromLaneSignature(Profile, Signature); });
+
+				if (NewProfile)
+				{
+					ProfileCache.Add(Key, NewProfile);
+				}
+				return NewProfile;
+			});
+	}
 
 	for (const FString& Warning : Result.Warnings)
 	{
@@ -183,116 +192,6 @@ void UFlexNetworkEdModeSettings::GenerateCurbstones()
 		return;
 	}
 
-	const UFlexNetworkSettings* Settings = GetDefault<UFlexNetworkSettings>();
-
-	TArray<TArray<FVector>> CurbLines;
-
-	// One curb line per side of every road that has a sidewalk -- clipped to the same trimmed
-	// range the road's own mesh uses at each end (JunctionData::TrimArcLengthBySegment, resolved
-	// the same way UFlexNetworkSubsystem::RebuildDirty does for a segment's roadway trim), so the
-	// curbstones stop at the junction boundary instead of continuing along the pre-trim curve
-	// straight across the intersection surface.
-	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Subsystem->GetAllSegments())
-	{
-		const FFlexSegmentId SegId = Pair.Key;
-		const FFlexRoadSegment& Segment = Pair.Value;
-		if (!Segment.Profile || Segment.Profile->SidewalkWidth <= KINDA_SMALL_NUMBER || !Segment.ArcLengthTable.IsValid())
-		{
-			continue;
-		}
-
-		const FFlexRoadNode* StartNode = Subsystem->GetNode(Segment.StartNodeId);
-		const FVector ReferenceUp = StartNode ? StartNode->UpVector : FVector::UpVector;
-		const float RoadwayHalfWidth = Segment.Profile->GetRoadwayHalfWidth();
-		const float SegmentLength = Segment.ArcLengthTable.GetTotalLength();
-
-		float TrimStart = 0.f;
-		float TrimEnd = SegmentLength;
-		if (const FFlexJunctionData* StartJunction = Subsystem->GetJunctionData(Segment.StartNodeId))
-		{
-			if (const float* Trim = StartJunction->TrimArcLengthBySegment.Find(SegId))
-			{
-				TrimStart = *Trim;
-			}
-		}
-		if (const FFlexJunctionData* EndJunction = Subsystem->GetJunctionData(Segment.EndNodeId))
-		{
-			if (const float* Trim = EndJunction->TrimArcLengthBySegment.Find(SegId))
-			{
-				TrimEnd = *Trim;
-			}
-		}
-
-		const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(Segment.Curve, Segment.ArcLengthTable, ReferenceUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
-		if (Frames.Num() < 2)
-		{
-			continue;
-		}
-
-		TArray<FVector> LeftLine, RightLine;
-		LeftLine.Reserve(Frames.Num());
-		RightLine.Reserve(Frames.Num());
-		for (const FFlexCurveFrame& Frame : Frames)
-		{
-			LeftLine.Add(Frame.Position - Frame.Right * RoadwayHalfWidth);
-			RightLine.Add(Frame.Position + Frame.Right * RoadwayHalfWidth);
-		}
-		CurbLines.Add(MoveTemp(LeftLine));
-		CurbLines.Add(MoveTemp(RightLine));
-	}
-
-	// One curb line per contiguous run of genuine curb-line edges around each junction's drivable
-	// polygon boundary -- NOT one single closed loop around the whole thing, since the boundary
-	// also has a short "closing" edge at each approach's own near-node end (connecting that
-	// approach's left curb point to its right one, running straight across the road rather than
-	// along it -- see FFlexJunctionData::PolygonEdgeIsCurbLine). Placing a curbstone along a
-	// closing edge would stretch a curb-profile mesh across the full road width instead of along
-	// the curb, so those edges are skipped, splitting the ring into one open run per corner.
-	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Subsystem->GetAllNodes())
-	{
-		const FFlexJunctionData* Junction = Subsystem->GetJunctionData(Pair.Key);
-		const int32 NumVerts = Junction ? Junction->PolygonBoundary.Num() : 0;
-		if (NumVerts < 3)
-		{
-			continue;
-		}
-
-		auto IsCurbEdge = [Junction](int32 EdgeIdx) { return !Junction->PolygonEdgeIsCurbLine.IsValidIndex(EdgeIdx) || Junction->PolygonEdgeIsCurbLine[EdgeIdx]; };
-
-		// Start right after a closing edge (guaranteed to exist -- one per approach) so a single
-		// linear pass around the ring, with no wraparound stitching, captures every run intact.
-		int32 StartIdx = 0;
-		for (int32 i = 0; i < NumVerts; ++i)
-		{
-			if (!IsCurbEdge((i - 1 + NumVerts) % NumVerts))
-			{
-				StartIdx = i;
-				break;
-			}
-		}
-
-		TArray<FVector> Current;
-		Current.Add(Junction->PolygonBoundary[StartIdx]);
-		for (int32 Step = 0; Step < NumVerts; ++Step)
-		{
-			const int32 Idx = (StartIdx + Step) % NumVerts;
-			const int32 NextIdx = (Idx + 1) % NumVerts;
-			if (!IsCurbEdge(Idx))
-			{
-				if (Current.Num() >= 2)
-				{
-					CurbLines.Add(Current);
-				}
-				Current.Reset();
-			}
-			Current.Add(Junction->PolygonBoundary[NextIdx]);
-		}
-		if (Current.Num() >= 2)
-		{
-			CurbLines.Add(MoveTemp(Current));
-		}
-	}
-
 	AFlexNetworkMeshActor* MeshActor = Subsystem->GetMeshActor();
 	if (!MeshActor)
 	{
@@ -302,6 +201,7 @@ void UFlexNetworkEdModeSettings::GenerateCurbstones()
 
 	FScopedTransaction Transaction(NSLOCTEXT("FlexNetwork", "GenerateCurbstones", "Generate Curbstones"));
 	MeshActor->Modify();
+	const TArray<TArray<FVector>>& CurbLines = MeshActor->GetUnifiedCurbLines();
 	MeshActor->ApplyCurbstones(CurbLines, CurbstoneMesh);
 	UE_LOG(LogTemp, Display, TEXT("FlexNetwork: generated curbstones along %d curb line(s)."), CurbLines.Num());
 }

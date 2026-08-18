@@ -2,6 +2,7 @@
 #include "Osm/OsmDataAsset.h"
 #include "FlexNetworkSubsystem.h"
 #include "RoadTypeProfile.h"
+#include "Misc/ScopeExit.h"
 
 namespace
 {
@@ -578,6 +579,13 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 	TMap<FString, URoadTypeProfile*> ProfileCache;
 
 	Subsystem.BeginBatchUpdate();
+	ON_SCOPE_EXIT
+	{
+		// Nested batches are supported. For a direct runtime import this is the one and only
+		// RebuildDirty trigger; the editor wraps visualization-mode changes in an outer batch, in
+		// which case this merely returns control to that outer transaction.
+		Subsystem.EndBatchUpdate();
+	};
 
 	for (int64 WayId : MatchingWayIds)
 	{
@@ -739,8 +747,6 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 
 		++Result.NumWaysImported;
 	}
-
-	Subsystem.EndBatchUpdate();
 
 	return Result;
 }

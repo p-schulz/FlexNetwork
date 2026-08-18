@@ -71,6 +71,14 @@ public:
 	float ParallelApproachAngleToleranceDegrees = 30.f;
 
 	/**
+	 * Minimum clear road length (cm) needed between two junction trim boundaries before classic
+	 * generation is allowed to place sidewalk/curb between them. Below this, the junction surfaces
+	 * are bridged and the consumed roadside region is suppressed.
+	 */
+	UPROPERTY(EditAnywhere, Config, Category = "Intersections", meta = (ClampMin = "0.0", Units = "cm"))
+	float CloseJunctionRoadsideClearance = 600.f;
+
+	/**
 	 * Vertical offset (cm) every generated road/junction mesh sits above its own logical height --
 	 * terrain conforming flattens the landscape to that same logical height, so without this the
 	 * generated meshes and the landscape underneath them are exactly coplanar and z-fight. Applied

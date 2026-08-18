@@ -2,7 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataAsset.h"
-#include "Osm/OsmTypes.h"
+// Keep this relative to this header's own directory. Other plugins may also have a public
+// "Osm/OsmTypes.h" (BuildingGrammar does), and dependency include-path order must not decide which
+// unrelated FOsmNode model backs this reflected asset.
+#include "OsmTypes.h"
 #include "OsmDataAsset.generated.h"
 
 /**
