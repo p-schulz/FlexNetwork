@@ -16,6 +16,23 @@
 #include "Engine/Texture2D.h"
 #include "Materials/MaterialInterface.h"
 
+#if WITH_EDITOR
+void UFlexNetworkEdModeSettings::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+	Super::PostEditChangeProperty(PropertyChangedEvent);
+	if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(UFlexNetworkEdModeSettings, VisualizationMode))
+	{
+		if (UWorld* World = TargetWorld.Get())
+		{
+			if (UFlexNetworkSubsystem* Subsystem = World->GetSubsystem<UFlexNetworkSubsystem>())
+			{
+				Subsystem->SetVisualizationMode(VisualizationMode);
+			}
+		}
+	}
+}
+#endif
+
 void UFlexNetworkEdModeSettings::GenerateRoadsFromOsm()
 {
 	UWorld* World = TargetWorld.Get();
@@ -31,6 +48,7 @@ void UFlexNetworkEdModeSettings::GenerateRoadsFromOsm()
 		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: UFlexNetworkSubsystem not available on this world."));
 		return;
 	}
+	Subsystem->SetVisualizationMode(VisualizationMode);
 
 	if (!OsmAsset)
 	{
@@ -74,6 +92,19 @@ void UFlexNetworkEdModeSettings::GenerateRoadsFromOsm()
 
 	UE_LOG(LogTemp, Display, TEXT("FlexNetwork: OSM import complete -- %d way(s) imported, %d segment(s)/%d node(s) created, %d junction(s) merged, %d distinct lane profile(s) generated under /FlexNetwork/Profiles/OSM/."),
 		Result.NumWaysImported, Result.NumSegmentsCreated, Result.NumNodesCreated, Result.NumJunctionsMerged, Result.NumDistinctLaneSignatures);
+}
+
+void UFlexNetworkEdModeSettings::RebuildAllNetworkGeometry()
+{
+	UWorld* World = TargetWorld.Get();
+	UFlexNetworkSubsystem* Subsystem = World ? World->GetSubsystem<UFlexNetworkSubsystem>() : nullptr;
+	if (!Subsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: no world subsystem available to rebuild."));
+		return;
+	}
+	Subsystem->RebuildAllNetworkGeometry();
+	UE_LOG(LogTemp, Display, TEXT("FlexNetwork: rebuilt all network geometry and segment sources."));
 }
 
 void UFlexNetworkEdModeSettings::ConformTerrainToRoads()
@@ -120,13 +151,13 @@ void UFlexNetworkEdModeSettings::FitRoadsToTerrain()
 
 void UFlexNetworkEdModeSettings::ApplyMaterialsToAllProfiles()
 {
-	if (!StandardRoadMaterial && !StandardSidewalkMaterial && !StandardJunctionMaterial && !StandardMedianMaterial)
+	if (!StandardRoadMaterial && !StandardSidewalkMaterial && !StandardCrosswalkMaterial && !StandardJunctionMaterial && !StandardMedianMaterial)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: set at least one Standard*Material before applying."));
 		return;
 	}
 
-	const int32 NumModified = FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(StandardRoadMaterial, StandardSidewalkMaterial, StandardJunctionMaterial, StandardMedianMaterial);
+	const int32 NumModified = FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(StandardRoadMaterial, StandardSidewalkMaterial, StandardCrosswalkMaterial, StandardJunctionMaterial, StandardMedianMaterial);
 	UE_LOG(LogTemp, Display, TEXT("FlexNetwork: applied materials to %d road profile asset(s)."), NumModified);
 }
 

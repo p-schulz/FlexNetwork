@@ -83,6 +83,10 @@ UFlexNetworkEdModeSettings* FFlexNetworkEdMode::GetOrCreateModeSettings() const
 	// by calling GetWorld() fresh each time via GetSubsystem(); this keeps the OSM path consistent
 	// with that instead of being the one place with a caching bug.
 	ModeSettings->TargetWorld = GetWorld();
+	if (UFlexNetworkSubsystem* Subsystem = GetSubsystem())
+	{
+		Subsystem->SetVisualizationMode(ModeSettings->VisualizationMode);
+	}
 	return ModeSettings;
 }
 

@@ -3,6 +3,15 @@
 #include "CoreMinimal.h"
 #include "FlexNetworkTypes.generated.h"
 
+/** Which transient world representation the subsystem maintains for authored/imported roads. */
+UENUM(BlueprintType)
+enum class EFlexNetworkVisualizationMode : uint8
+{
+	GeneratedGeometry UMETA(DisplayName = "Generated Geometry"),
+	SegmentActors UMETA(DisplayName = "Segment Actors (Splines + PCG, No Geometry)"),
+	Both UMETA(DisplayName = "Generated Geometry + Segment Actors")
+};
+
 /** Elevation/structure type of a node or the segment between two nodes. */
 UENUM(BlueprintType)
 enum class EFlexRoadElevationType : uint8

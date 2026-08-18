@@ -193,4 +193,47 @@ bool FFlexParallelApproachNoSidewalkTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+// Two roads crossing at a very acute angle need substantially more setback than an orthogonal
+// junction. The old width-based reach cap cut all four roads but then discarded the crossing
+// polygon as self-intersecting, leaving exactly the empty center shown in the regression report.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFlexAcuteCrossingSurfaceTest, "FlexNetwork.Intersection.AcuteCrossingProducesSurfaceAndSidewalks", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FFlexAcuteCrossingSurfaceTest::RunTest(const FString& Parameters)
+{
+	using namespace FlexSafeIntersectionTestHelpers;
+	if (!GEditor) return false;
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	UFlexNetworkSubsystem* Subsystem = World ? World->GetSubsystem<UFlexNetworkSubsystem>() : nullptr;
+	if (!TestNotNull(TEXT("FlexNetwork subsystem available"), Subsystem)) return false;
+
+	URoadTypeProfile* Profile = MakeSidewalkProfile(350.f, 200.f);
+	const FVector HubPos(0, 90000, 0);
+	const FFlexNodeId Hub = Subsystem->AddNode(HubPos);
+	Subsystem->BeginBatchUpdate();
+	for (const float AngleDegrees : { -7.5f, 7.5f, 172.5f, 187.5f })
+	{
+		const float Radians = FMath::DegreesToRadians(AngleDegrees);
+		const FVector Dir(FMath::Cos(Radians), FMath::Sin(Radians), 0.f);
+		const FFlexNodeId Arm = Subsystem->AddNode(HubPos + Dir * 12000.f);
+		Subsystem->AddSegment(Hub, Arm, HubPos + Dir * 3500.f, HubPos + Dir * 8500.f, Profile);
+	}
+	Subsystem->EndBatchUpdate();
+
+	const FFlexJunctionData* Junction = Subsystem->GetJunctionData(Hub);
+	if (!TestNotNull(TEXT("Acute crossing junction exists"), Junction)) return false;
+	TestTrue(TEXT("Acute crossing has a surface boundary"), Junction->PolygonBoundary.Num() >= 4);
+	TestTrue(TEXT("Acute crossing surface triangulates"), Junction->PolygonTriangleIndices.Num() >= 3);
+	TestTrue(TEXT("Acute crossing retains smooth sidewalk returns"), Junction->CornerIslands.Num() >= 2);
+	for (const TPair<FFlexSegmentId, float>& Trim : Junction->TrimArcLengthBySegment)
+	{
+		const FFlexRoadSegment* Segment = Subsystem->GetSegment(Trim.Key);
+		if (Segment)
+		{
+			const float DistanceFromNode = Segment->StartNodeId == Hub ? Trim.Value : Segment->GetLength() - Trim.Value;
+			TestTrue(TEXT("Acute crossing consumes available road length for its setback"), DistanceFromNode > Profile->GetOuterExtent());
+		}
+	}
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

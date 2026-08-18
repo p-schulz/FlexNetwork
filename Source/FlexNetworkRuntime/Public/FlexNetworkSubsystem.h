@@ -12,7 +12,10 @@
 #include "FlexNetworkSubsystem.generated.h"
 
 class AFlexNetworkMeshActor;
+class AFlexNetworkSegmentActor;
 class UFlexNetworkSettings;
+struct FFlexSegmentMeshResult;
+struct FFlexJunctionMeshResult;
 
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnRoadNetworkChangedNative, const TArray<FFlexNodeId>& /*ChangedNodes*/, const TArray<FFlexSegmentId>& /*ChangedSegments*/);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRoadNetworkChangedDynamic, const TArray<FFlexNodeId>&, ChangedNodes, const TArray<FFlexSegmentId>&, ChangedSegments);
@@ -130,10 +133,27 @@ public:
 	const FFlexJunctionData* GetJunctionData(FFlexNodeId NodeId) const { return JunctionDataByNode.Find(NodeId); }
 	TArray<FFlexLaneConnector> GetLaneConnectorsAtNode(FFlexNodeId NodeId) const;
 
+	/** Builds the current visible segment result from graph data, including trims from both endpoint junctions. */
+	bool BuildSegmentMeshResult(FFlexSegmentId SegmentId, FFlexSegmentMeshResult& OutResult) const;
+
+	/** Resolves both endpoint trims from the authoritative cached junction data. */
+	bool GetSegmentTrimRange(FFlexSegmentId SegmentId, float& OutTrimStart, float& OutTrimEnd) const;
+
+	/** Builds all visible layers of a cached junction using the same materials and geometry as the actor renderer. */
+	bool BuildJunctionMeshResult(FFlexNodeId NodeId, FFlexJunctionMeshResult& OutResult) const;
+
 	/** Position/tangent/right/up at ArcLength along Segment -- what the traffic sim samples to drive a vehicle along a lane (offset laterally by the lane's LateralOffset). */
 	FFlexCurveFrame SampleSegmentAtArcLength(FFlexSegmentId SegmentId, float ArcLength) const;
 
 	AFlexNetworkMeshActor* GetMeshActor() const { return MeshActor; }
+	AFlexNetworkSegmentActor* GetSegmentActor(FFlexSegmentId SegmentId) const;
+	EFlexNetworkVisualizationMode GetVisualizationMode() const { return VisualizationMode; }
+
+	/** Switches representation and rebuilds all existing hand-authored or OSM-imported segments. */
+	void SetVisualizationMode(EFlexNetworkVisualizationMode NewMode);
+
+	/** Marks the complete graph dirty and rebuilds the currently selected representation. */
+	void RebuildAllNetworkGeometry();
 
 	// ---------------------------------------------------------------- Extension points
 
@@ -175,11 +195,18 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<AFlexNetworkMeshActor> MeshActor;
 
+	/** Lightweight spline/PCG sources, one per graph segment. They intentionally contain no mesh geometry. */
+	UPROPERTY(Transient)
+	TMap<FFlexSegmentId, TObjectPtr<AFlexNetworkSegmentActor>> SegmentActors;
+
+	EFlexNetworkVisualizationMode VisualizationMode = EFlexNetworkVisualizationMode::GeneratedGeometry;
+
 	TSet<FFlexNodeId> DirtyNodes;
 	TSet<FFlexSegmentId> DirtySegments;
 	int32 BatchDepth = 0;
 
 	AFlexNetworkMeshActor* GetOrCreateMeshActor();
+	AFlexNetworkSegmentActor* GetOrCreateSegmentActor(FFlexSegmentId SegmentId);
 	const UFlexNetworkSettings* GetSettings() const;
 
 	FVector2D NodeSegmentBoundsMin(const FFlexRoadSegment& Segment) const;

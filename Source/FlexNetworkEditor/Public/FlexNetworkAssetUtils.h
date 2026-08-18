@@ -19,12 +19,12 @@ namespace FlexNetworkAssetUtils
 
 	/**
 	 * Finds every URoadTypeProfile asset in the project (via the asset registry, not just ones the
-	 * current session created) and overwrites whichever of its four material slots has a non-null
+	 * current session created) and overwrites whichever material slots have a non-null
 	 * override supplied here -- a null argument leaves that slot untouched on every profile, so a
 	 * caller can update e.g. just RoadMaterial across the board without disturbing per-profile
 	 * SidewalkMaterial/etc. choices. Existing-scale escape hatch for a large OSM import, which can
 	 * generate dozens of auto-named profiles that would otherwise all need their materials set by
 	 * hand one at a time. Saves each modified profile to disk. Returns how many were changed.
 	 */
-	FLEXNETWORKEDITOR_API int32 ApplyMaterialsToAllProfiles(UMaterialInterface* RoadMaterial, UMaterialInterface* SidewalkMaterial, UMaterialInterface* JunctionMaterial, UMaterialInterface* MedianMaterial);
+	FLEXNETWORKEDITOR_API int32 ApplyMaterialsToAllProfiles(UMaterialInterface* RoadMaterial, UMaterialInterface* SidewalkMaterial, UMaterialInterface* CrosswalkMaterial, UMaterialInterface* JunctionMaterial, UMaterialInterface* MedianMaterial);
 }

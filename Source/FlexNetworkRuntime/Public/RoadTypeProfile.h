@@ -85,8 +85,16 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")
 	TObjectPtr<UMaterialInterface> SidewalkMaterial = nullptr;
 
+	/** Material for PCG/procedural curb prisms; falls back to SidewalkMaterial when unset. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")
+	TObjectPtr<UMaterialInterface> CurbMaterial = nullptr;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")
 	TObjectPtr<UMaterialInterface> JunctionMaterial = nullptr;
+
+	/** Material for intersection crosswalk strips; falls back to SidewalkMaterial when unset. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")
+	TObjectPtr<UMaterialInterface> CrosswalkMaterial = nullptr;
 
 	/** Fill for the rounded corner islands/refuges the sidewalk curves around at junctions (grass/landscaping is typical -- falls back to SidewalkMaterial if left unset). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")

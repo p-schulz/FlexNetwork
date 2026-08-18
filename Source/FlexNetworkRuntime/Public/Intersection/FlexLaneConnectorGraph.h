@@ -33,6 +33,14 @@ struct FLEXNETWORKRUNTIME_API FFlexLaneConnector
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FlexNetwork")
 	float SpeedLimit = 0.f;
+
+	/** Signed-lane travel direction change from entry to exit, in degrees (0=straight, 180=hairpin). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FlexNetwork")
+	float TurnAngleDegrees = 0.f;
+
+	/** Convenience classification for consumers that apply special steering/speed behavior. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FlexNetwork")
+	bool bSharpTurn = false;
 };
 
 /** A rule-placed crosswalk/curb-cut strip where a sidewalk meets the junction polygon boundary. */

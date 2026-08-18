@@ -4,6 +4,8 @@
 #include "Engine/DeveloperSettings.h"
 #include "FlexNetworkSettings.generated.h"
 
+class AFlexNetworkSegmentActor;
+
 /**
  * Project-wide tunables for the FlexNetwork authoring/generation pipeline. Values that vary
  * per road type (max grade, min turn radius) live on URoadTypeProfile instead -- these are the
@@ -88,6 +90,13 @@ public:
 	/** Chord-deviation tolerance (cm) that stops adaptive arc-length subdivision early. */
 	UPROPERTY(EditAnywhere, Config, Category = "Mesh", meta = (ClampMin = "0.01", Units = "cm"))
 	float ArcLengthChordTolerance = 2.f;
+
+	/**
+	 * Optional actor subclass spawned for every segment. A Blueprint subclass can preconfigure the
+	 * built-in PCG component with a graph; null uses the native visualization actor.
+	 */
+	UPROPERTY(EditAnywhere, Config, Category = "PCG")
+	TSubclassOf<AFlexNetworkSegmentActor> SegmentActorClass;
 
 	/** Extra margin (cm), beyond each road's own half-width, that terrain conforming flattens/blends. */
 	UPROPERTY(EditAnywhere, Config, Category = "Terrain", meta = (ClampMin = "0.0", Units = "cm"))

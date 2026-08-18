@@ -33,7 +33,7 @@ URoadTypeProfile* FlexNetworkAssetUtils::CreateRoadTypeProfileAsset(const FStrin
 	return Profile;
 }
 
-int32 FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(UMaterialInterface* RoadMaterial, UMaterialInterface* SidewalkMaterial, UMaterialInterface* JunctionMaterial, UMaterialInterface* MedianMaterial)
+int32 FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(UMaterialInterface* RoadMaterial, UMaterialInterface* SidewalkMaterial, UMaterialInterface* CrosswalkMaterial, UMaterialInterface* JunctionMaterial, UMaterialInterface* MedianMaterial)
 {
 	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 
@@ -58,6 +58,11 @@ int32 FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(UMaterialInterface* Roa
 		if (SidewalkMaterial && Profile->SidewalkMaterial != SidewalkMaterial)
 		{
 			Profile->SidewalkMaterial = SidewalkMaterial;
+			bChanged = true;
+		}
+		if (CrosswalkMaterial && Profile->CrosswalkMaterial != CrosswalkMaterial)
+		{
+			Profile->CrosswalkMaterial = CrosswalkMaterial;
 			bChanged = true;
 		}
 		if (JunctionMaterial && Profile->JunctionMaterial != JunctionMaterial)

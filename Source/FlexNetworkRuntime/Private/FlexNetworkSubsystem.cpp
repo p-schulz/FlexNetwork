@@ -1,6 +1,8 @@
 #include "FlexNetworkSubsystem.h"
 #include "FlexNetworkSettings.h"
 #include "FlexNetworkMeshActor.h"
+#include "FlexNetworkSegmentActor.h"
+#include "PCGComponent.h"
 #include "Math/FlexBezierMath.h"
 #include "Math/FlexGeometry2D.h"
 #include "Mesh/FlexRoadMeshBuilder.h"
@@ -52,6 +54,15 @@ void UFlexNetworkSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UFlexNetworkSubsystem::Deinitialize()
 {
+	for (TPair<FFlexSegmentId, TObjectPtr<AFlexNetworkSegmentActor>>& Pair : SegmentActors)
+	{
+		if (Pair.Value)
+		{
+			if (Pair.Value->PCGComponent) Pair.Value->PCGComponent->CleanupLocalImmediate(true, true);
+			Pair.Value->Destroy();
+		}
+	}
+	SegmentActors.Reset();
 	if (MeshActor)
 	{
 		MeshActor->Destroy();
@@ -60,6 +71,74 @@ void UFlexNetworkSubsystem::Deinitialize()
 	TerrainConformer.Reset();
 	Exporters.Reset();
 	Super::Deinitialize();
+}
+
+AFlexNetworkSegmentActor* UFlexNetworkSubsystem::GetSegmentActor(FFlexSegmentId SegmentId) const
+{
+	const TObjectPtr<AFlexNetworkSegmentActor>* Found = SegmentActors.Find(SegmentId);
+	return Found ? Found->Get() : nullptr;
+}
+
+AFlexNetworkSegmentActor* UFlexNetworkSubsystem::GetOrCreateSegmentActor(FFlexSegmentId SegmentId)
+{
+	if (TObjectPtr<AFlexNetworkSegmentActor>* Found = SegmentActors.Find(SegmentId)) return *Found;
+	UWorld* World = GetWorld();
+	if (!World) return nullptr;
+	TSubclassOf<AFlexNetworkSegmentActor> ActorClass = GetSettings()->SegmentActorClass;
+	if (!ActorClass)
+	{
+		ActorClass = AFlexNetworkSegmentActor::StaticClass();
+	}
+	// Set the stable ID before components register/PCG can auto-generate from a configured subclass.
+	AFlexNetworkSegmentActor* Actor = World->SpawnActorDeferred<AFlexNetworkSegmentActor>(
+		ActorClass, FTransform::Identity, nullptr, nullptr, ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+	if (Actor)
+	{
+		Actor->SegmentId = SegmentId;
+		Actor->SetFlags(RF_Transient);
+		Actor->FinishSpawning(FTransform::Identity);
+	}
+	if (Actor) SegmentActors.Add(SegmentId, Actor);
+	return Actor;
+}
+
+void UFlexNetworkSubsystem::SetVisualizationMode(EFlexNetworkVisualizationMode NewMode)
+{
+	if (VisualizationMode == NewMode) return;
+	VisualizationMode = NewMode;
+
+	const bool bWantGeometry = NewMode != EFlexNetworkVisualizationMode::SegmentActors;
+	const bool bWantActors = NewMode != EFlexNetworkVisualizationMode::GeneratedGeometry;
+	if (!bWantGeometry && MeshActor)
+	{
+		MeshActor->Destroy();
+		MeshActor = nullptr;
+	}
+	if (!bWantActors)
+	{
+		for (TPair<FFlexSegmentId, TObjectPtr<AFlexNetworkSegmentActor>>& Pair : SegmentActors)
+		{
+			if (Pair.Value)
+			{
+				if (Pair.Value->PCGComponent) Pair.Value->PCGComponent->CleanupLocalImmediate(true, true);
+				Pair.Value->Destroy();
+			}
+		}
+		SegmentActors.Reset();
+	}
+
+	// Use the normal incremental pipeline with every graph item marked dirty. This also covers
+	// segments created by a previous OSM batch without introducing a second import-only path.
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments) DirtySegments.Add(Pair.Key);
+	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Nodes) DirtyNodes.Add(Pair.Key);
+	RebuildDirty();
+}
+
+void UFlexNetworkSubsystem::RebuildAllNetworkGeometry()
+{
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments) DirtySegments.Add(Pair.Key);
+	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Nodes) DirtyNodes.Add(Pair.Key);
+	RebuildDirty();
 }
 
 const UFlexNetworkSettings* UFlexNetworkSubsystem::GetSettings() const
@@ -189,6 +268,14 @@ bool UFlexNetworkSubsystem::RemoveSegment(FFlexSegmentId SegmentId)
 	if (MeshActor)
 	{
 		MeshActor->RemoveSegmentMesh(SegmentId);
+	}
+	if (TObjectPtr<AFlexNetworkSegmentActor> SegmentActor; SegmentActors.RemoveAndCopyValue(SegmentId, SegmentActor) && SegmentActor)
+	{
+		if (SegmentActor->PCGComponent)
+		{
+			SegmentActor->PCGComponent->CleanupLocalImmediate(true, true);
+		}
+		SegmentActor->Destroy();
 	}
 
 	const FFlexNodeId StartId = Segment->StartNodeId;
@@ -359,7 +446,9 @@ FFlexNodeId UFlexNetworkSubsystem::SplitSegment(FFlexSegmentId SegmentId, float 
 	URoadTypeProfile* Profile = Segment->Profile;
 	const EFlexRoadElevationType ElevationType = Segment->ElevationType;
 	const FFlexElevationProfile ElevationProfile = Segment->ElevationProfile;
-	const FVector SplitUp = Nodes.Contains(OldStartId) ? Nodes.FindChecked(OldStartId).UpVector : FVector::UpVector;
+	const FVector ReferenceUp = Nodes.Contains(OldStartId) ? Nodes.FindChecked(OldStartId).UpVector : FVector::UpVector;
+	const FVector SplitUp = FFlexRoadMeshBuilder::SampleFrameAtArcLength(
+		Segment->Curve, Segment->ArcLengthTable, ClampedArcLength, ReferenceUp).Up;
 
 	const FFlexNodeId NewNodeId = AddNode(Left.P3, ElevationType, SplitUp);
 
@@ -689,6 +778,80 @@ TArray<FFlexLaneConnector> UFlexNetworkSubsystem::GetLaneConnectorsAtNode(FFlexN
 	return {};
 }
 
+bool UFlexNetworkSubsystem::BuildSegmentMeshResult(FFlexSegmentId SegmentId, FFlexSegmentMeshResult& OutResult) const
+{
+	const FFlexRoadSegment* Segment = Segments.Find(SegmentId);
+	if (!Segment || !Segment->Profile || !Segment->ArcLengthTable.IsValid())
+	{
+		return false;
+	}
+
+	float TrimStart = 0.f, TrimEnd = 0.f;
+	if (!GetSegmentTrimRange(SegmentId, TrimStart, TrimEnd))
+	{
+		return false;
+	}
+
+	const FFlexRoadNode* StartNode = Nodes.Find(Segment->StartNodeId);
+	OutResult = FFlexRoadMeshBuilder::BuildSegmentMesh(Segment->Curve, Segment->ArcLengthTable,
+		Segment->Profile, StartNode ? StartNode->UpVector : FVector::UpVector,
+		GetSettings()->ArcLengthSampleStep, TrimStart, TrimEnd);
+	return !OutResult.Roadway.IsEmpty() || !OutResult.Sidewalks.IsEmpty();
+}
+
+bool UFlexNetworkSubsystem::GetSegmentTrimRange(FFlexSegmentId SegmentId, float& OutTrimStart, float& OutTrimEnd) const
+{
+	const FFlexRoadSegment* Segment = Segments.Find(SegmentId);
+	if (!Segment || !Segment->ArcLengthTable.IsValid()) return false;
+	OutTrimStart = 0.f;
+	OutTrimEnd = Segment->GetLength();
+	if (const FFlexJunctionData* StartJunction = JunctionDataByNode.Find(Segment->StartNodeId))
+	{
+		if (const float* Trim = StartJunction->TrimArcLengthBySegment.Find(SegmentId))
+		{
+			OutTrimStart = *Trim;
+		}
+	}
+	if (const FFlexJunctionData* EndJunction = JunctionDataByNode.Find(Segment->EndNodeId))
+	{
+		if (const float* Trim = EndJunction->TrimArcLengthBySegment.Find(SegmentId))
+		{
+			OutTrimEnd = *Trim;
+		}
+	}
+	OutTrimStart = FMath::Clamp(OutTrimStart, 0.f, Segment->GetLength());
+	OutTrimEnd = FMath::Clamp(OutTrimEnd, OutTrimStart, Segment->GetLength());
+	return true;
+}
+
+bool UFlexNetworkSubsystem::BuildJunctionMeshResult(FFlexNodeId NodeId, FFlexJunctionMeshResult& OutResult) const
+{
+	const FFlexRoadNode* Node = Nodes.Find(NodeId);
+	const FFlexJunctionData* Junction = JunctionDataByNode.Find(NodeId);
+	if (!Node || !Junction || Junction->IsEmpty())
+	{
+		return false;
+	}
+
+	UMaterialInterface* JunctionMaterial = nullptr;
+	UMaterialInterface* CrosswalkMaterial = nullptr;
+	UMaterialInterface* SidewalkMaterial = nullptr;
+	UMaterialInterface* MedianMaterial = nullptr;
+	for (FFlexSegmentId SegmentId : Node->ConnectedSegments)
+	{
+		if (const FFlexRoadSegment* Segment = Segments.Find(SegmentId); Segment && Segment->Profile)
+		{
+			JunctionMaterial = JunctionMaterial ? JunctionMaterial : Segment->Profile->JunctionMaterial.Get();
+			CrosswalkMaterial = CrosswalkMaterial ? CrosswalkMaterial : Segment->Profile->CrosswalkMaterial.Get();
+			SidewalkMaterial = SidewalkMaterial ? SidewalkMaterial : Segment->Profile->SidewalkMaterial.Get();
+			MedianMaterial = MedianMaterial ? MedianMaterial : Segment->Profile->MedianMaterial.Get();
+		}
+	}
+	OutResult = FFlexIntersectionBuilder::BuildJunctionMesh(Node->UpVector, *Junction,
+		JunctionMaterial, CrosswalkMaterial ? CrosswalkMaterial : SidewalkMaterial, SidewalkMaterial, MedianMaterial);
+	return !OutResult.Surface.IsEmpty() || !OutResult.SidewalkCorners.IsEmpty();
+}
+
 FFlexCurveFrame UFlexNetworkSubsystem::SampleSegmentAtArcLength(FFlexSegmentId SegmentId, float ArcLength) const
 {
 	const FFlexRoadSegment* Segment = Segments.Find(SegmentId);
@@ -895,16 +1058,30 @@ void UFlexNetworkSubsystem::RebuildDirty()
 		Node->RoleFlags = NewRoleFlags;
 	}
 
+	// A segment pulled into the rebuild because one endpoint changed can still terminate at an
+	// unchanged junction. Re-resolve BOTH ends from the authoritative cache after affected
+	// junctions have been updated; otherwise the unchanged end silently resets to 0/full length.
+	for (FFlexSegmentId SegId : FinalDirtySegments)
+	{
+		float TrimStart = 0.f, TrimEnd = 0.f;
+		if (GetSegmentTrimRange(SegId, TrimStart, TrimEnd))
+		{
+			TrimRangeBySegment.FindOrAdd(SegId) = TPair<float, float>(TrimStart, TrimEnd);
+		}
+	}
+
 	// 5. Build + apply segment meshes. Building is pure per-segment work (no shared mutable
 	// state), so it's safe to parallelize across worker threads once the batch is big enough
 	// that ParallelFor's dispatch overhead is worth it; applying to components/terrain happens
 	// back on the game thread afterward, same as UProceduralMeshComponent/Landscape require.
 	TArray<FFlexSegmentId> SegmentIdsToRebuild = FinalDirtySegments.Array();
+	const bool bGenerateGeometry = VisualizationMode != EFlexNetworkVisualizationMode::SegmentActors;
+	const bool bGenerateSegmentActors = VisualizationMode != EFlexNetworkVisualizationMode::GeneratedGeometry;
 	TArray<FFlexSegmentMeshResult> MeshResults;
-	MeshResults.SetNum(SegmentIdsToRebuild.Num());
+	if (bGenerateGeometry) MeshResults.SetNum(SegmentIdsToRebuild.Num());
 
 	const bool bParallel = SegmentIdsToRebuild.Num() >= Settings->ParallelRebuildThreshold;
-	ParallelFor(SegmentIdsToRebuild.Num(), [this, &SegmentIdsToRebuild, &MeshResults, &TrimRangeBySegment, Settings](int32 Index)
+	if (bGenerateGeometry) ParallelFor(SegmentIdsToRebuild.Num(), [this, &SegmentIdsToRebuild, &MeshResults, &TrimRangeBySegment, Settings](int32 Index)
 	{
 		const FFlexSegmentId SegId = SegmentIdsToRebuild[Index];
 		const FFlexRoadSegment* Segment = Segments.Find(SegId);
@@ -921,7 +1098,7 @@ void UFlexNetworkSubsystem::RebuildDirty()
 		MeshResults[Index] = FFlexRoadMeshBuilder::BuildSegmentMesh(Segment->Curve, Segment->ArcLengthTable, Segment->Profile, RefUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
 	}, bParallel ? EParallelForFlags::None : EParallelForFlags::ForceSingleThread);
 
-	AFlexNetworkMeshActor* Actor = GetOrCreateMeshActor();
+	AFlexNetworkMeshActor* Actor = bGenerateGeometry ? GetOrCreateMeshActor() : nullptr;
 	UWorld* World = GetWorld();
 	for (int32 Index = 0; Index < SegmentIdsToRebuild.Num(); ++Index)
 	{
@@ -936,6 +1113,17 @@ void UFlexNetworkSubsystem::RebuildDirty()
 		{
 			Actor->ApplySegmentMesh(SegId, MeshResults[Index]);
 		}
+		if (bGenerateSegmentActors)
+		{
+			if (AFlexNetworkSegmentActor* SegmentActor = GetOrCreateSegmentActor(SegId))
+			{
+				const FVector RefUp = Nodes.Contains(Segment->StartNodeId) ? Nodes.FindChecked(Segment->StartNodeId).UpVector : FVector::UpVector;
+				const TPair<float, float>* Range = TrimRangeBySegment.Find(SegId);
+				const float TrimStart = Range ? Range->Key : 0.f;
+				const float TrimEnd = Range ? Range->Value : Segment->GetLength();
+				SegmentActor->UpdateFromSegment(SegId, *Segment, RefUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
+			}
+		}
 
 		// Only Ground segments get the terrain flattened to their height -- a Bridge/Elevated
 		// segment sits above the terrain by design (flattening under it would visually merge the
@@ -944,7 +1132,10 @@ void UFlexNetworkSubsystem::RebuildDirty()
 		if (TerrainConformer && Segment->Profile && Segment->ElevationType == EFlexRoadElevationType::Ground)
 		{
 			const FVector RefUp = Nodes.Contains(Segment->StartNodeId) ? Nodes.FindChecked(Segment->StartNodeId).UpVector : FVector::UpVector;
-			const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(Segment->Curve, Segment->ArcLengthTable, RefUp, Settings->ArcLengthSampleStep, MeshResults[Index].TrimStartArcLength, MeshResults[Index].TrimEndArcLength);
+			const TPair<float, float>* Range = TrimRangeBySegment.Find(SegId);
+			const float TrimStart = Range ? Range->Key : 0.f;
+			const float TrimEnd = Range ? Range->Value : Segment->GetLength();
+			const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(Segment->Curve, Segment->ArcLengthTable, RefUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
 			TerrainConformer->ConformSegment(World, SegId, Frames, Segment->Profile->GetRoadwayHalfWidth(), Settings->TerrainConformMargin, Settings->TerrainFalloffDistance);
 		}
 	}
@@ -958,8 +1149,10 @@ void UFlexNetworkSubsystem::RebuildDirty()
 			continue; // Node itself may have been removed as part of this batch.
 		}
 
-		if (const FFlexJunctionData* JunctionData = JunctionDataByNode.Find(NodeId))
+		if (bGenerateGeometry)
 		{
+		 if (const FFlexJunctionData* JunctionData = JunctionDataByNode.Find(NodeId))
+		 {
 			UMaterialInterface* SurfaceMaterial = nullptr;
 			UMaterialInterface* CrosswalkMaterial = nullptr;
 			UMaterialInterface* SidewalkMaterial = nullptr;
@@ -971,7 +1164,9 @@ void UFlexNetworkSubsystem::RebuildDirty()
 					if (FirstSegment->Profile)
 					{
 						SurfaceMaterial = FirstSegment->Profile->JunctionMaterial;
-						CrosswalkMaterial = FirstSegment->Profile->SidewalkMaterial;
+						CrosswalkMaterial = FirstSegment->Profile->CrosswalkMaterial
+							? FirstSegment->Profile->CrosswalkMaterial.Get()
+							: FirstSegment->Profile->SidewalkMaterial.Get();
 						SidewalkMaterial = FirstSegment->Profile->SidewalkMaterial;
 						MedianMaterial = FirstSegment->Profile->MedianMaterial;
 					}
@@ -982,6 +1177,7 @@ void UFlexNetworkSubsystem::RebuildDirty()
 			{
 				Actor->ApplyJunctionMesh(NodeId, JunctionMesh);
 			}
+		 }
 		}
 	}
 

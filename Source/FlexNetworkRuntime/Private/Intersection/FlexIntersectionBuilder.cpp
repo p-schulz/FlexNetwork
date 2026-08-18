@@ -129,6 +129,64 @@ namespace
 	};
 
 	/**
+	 * Guaranteed-simple fallback for acute multi-road crossings. It wraps the curb corners of every
+	 * trimmed approach in a convex hull. The detailed pairwise ring is preferable (it preserves
+	 * concave pockets), but a hull is a much better last resort than returning no surface after the
+	 * roads have already been cut back. Same-approach hull edges are road-mouth closing edges;
+	 * edges between approaches are genuine curb boundary.
+	 */
+	void BuildApproachMouthHull(const TArray<FSortedApproach>& Sorted, const TArray<FFlexJunctionApproachInput>& Approaches,
+		TMap<int32, float>& InOutTrimDistance, TArray<FVector2D>& OutHull, TArray<bool>& OutEdgeIsCurb)
+	{
+		struct FHullPoint { FVector2D P; int32 ApproachIndex = INDEX_NONE; };
+		TArray<FHullPoint> Points;
+		for (const FSortedApproach& Entry : Sorted)
+		{
+			const float Available = Approaches.IsValidIndex(Entry.ApproachIndex)
+				? Approaches[Entry.ApproachIndex].ArcLengthTable.GetTotalLength() * 0.45f : 0.f;
+			float& Trim = InOutTrimDistance.FindOrAdd(Entry.ApproachIndex, Entry.OuterExtent);
+			Trim = FMath::Clamp(FMath::Max(Trim, Entry.RoadwayHalfWidth), 0.f, Available);
+			const FVector2D Left(-Entry.Direction2D.Y, Entry.Direction2D.X);
+			const FVector2D Center = Entry.Direction2D * Trim;
+			Points.Add({ Center + Left * Entry.RoadwayHalfWidth, Entry.ApproachIndex });
+			Points.Add({ Center - Left * Entry.RoadwayHalfWidth, Entry.ApproachIndex });
+		}
+		Points.Sort([](const FHullPoint& A, const FHullPoint& B)
+		{
+			return A.P.X < B.P.X || (FMath::IsNearlyEqual(A.P.X, B.P.X) && A.P.Y < B.P.Y);
+		});
+		for (int32 i = Points.Num() - 1; i > 0; --i)
+		{
+			if (Points[i].P.Equals(Points[i - 1].P, KINDA_SMALL_NUMBER)) Points.RemoveAt(i);
+		}
+		if (Points.Num() < 3) return;
+		auto Cross = [](const FVector2D& O, const FVector2D& A, const FVector2D& B)
+		{
+			return (A.X - O.X) * (B.Y - O.Y) - (A.Y - O.Y) * (B.X - O.X);
+		};
+		TArray<FHullPoint> Hull;
+		for (const FHullPoint& Point : Points)
+		{
+			while (Hull.Num() >= 2 && Cross(Hull[Hull.Num() - 2].P, Hull.Last().P, Point.P) <= KINDA_SMALL_NUMBER) Hull.Pop();
+			Hull.Add(Point);
+		}
+		const int32 LowerCount = Hull.Num();
+		for (int32 i = Points.Num() - 2; i >= 0; --i)
+		{
+			while (Hull.Num() > LowerCount && Cross(Hull[Hull.Num() - 2].P, Hull.Last().P, Points[i].P) <= KINDA_SMALL_NUMBER) Hull.Pop();
+			Hull.Add(Points[i]);
+		}
+		Hull.Pop(); // repeated first point
+		OutHull.Reserve(Hull.Num());
+		OutEdgeIsCurb.Reserve(Hull.Num());
+		for (int32 i = 0; i < Hull.Num(); ++i)
+		{
+			OutHull.Add(Hull[i].P);
+			OutEdgeIsCurb.Add(Hull[i].ApproachIndex != Hull[(i + 1) % Hull.Num()].ApproachIndex);
+		}
+	}
+
+	/**
 	 * Builds one node's full ring of corners (sharp / DefaultFilletRadius-fillet / curb-return,
 	 * per angularly-adjacent pair) at a single attempted curb-return radius. Pure function of its
 	 * inputs and side-effect-free -- BuildJunction calls this repeatedly at different radii
@@ -198,7 +256,11 @@ namespace
 			// a real corner to round off; both are gated the same way, symmetrically.
 			const float CosTheta = FMath::Clamp(FVector2D::DotProduct(A.Direction2D, B.Direction2D), -1.f, 1.f);
 			const float AngleDeg = FMath::RadiansToDegrees(FMath::Acos(CosTheta));
-			const bool bIsGenuineCorner = AngleDeg >= ParallelApproachAngleToleranceDegrees && AngleDeg <= (180.f - ParallelApproachAngleToleranceDegrees);
+			// Two-approach shallow forks still use the configured parallel gate. At a real multi-road
+			// crossing, however, the acute wedge is a genuine intersection corner and needs a long
+			// sidewalk return; treating it as parallel is what left the screenshot's empty center.
+			const float EffectiveParallelTolerance = N >= 3 ? 2.f : ParallelApproachAngleToleranceDegrees;
+			const bool bIsGenuineCorner = AngleDeg >= EffectiveParallelTolerance && AngleDeg <= (180.f - EffectiveParallelTolerance);
 			const bool bBothHaveSidewalks = A.SidewalkWidth > KINDA_SMALL_NUMBER && B.SidewalkWidth > KINDA_SMALL_NUMBER
 				&& bIsGenuineCorner && CurbReturnRadiusAttempt > KINDA_SMALL_NUMBER;
 
@@ -229,8 +291,10 @@ namespace
 				// of a sharp pavement point -- and the sidewalk band + landscaped island below reuse
 				// this exact same center/sweep so all three read as one continuously curved feature.
 				//
-				// This per-pair cap (bounding the attempted radius by this pair's own road width and
-				// its flanking segments' own length) is a cheap fast-path, not the correctness
+				// This per-pair cap bounds the attempted radius by the flanking segments' genuinely
+				// available length. Acute crossings are intentionally not capped by road width: their
+				// valid miter/curb return can require many road widths of setback. This is a fast-path,
+				// not the correctness
 				// mechanism -- it does NOT by itself guarantee a simple polygon (an ordinary symmetric
 				// 90-degree 4-way at default settings already overlaps at the node's center without
 				// tripping either bound here), so the caller validates the *whole* resulting polygon
@@ -241,11 +305,11 @@ namespace
 					const float HalfTheta = FMath::Acos(CosTheta) * 0.5f;
 					if (HalfTheta > KINDA_SMALL_NUMBER)
 					{
-						const float AvgRoadwayHalfWidth = FMath::Max((A.RoadwayHalfWidth + B.RoadwayHalfWidth) * 0.5f, 1.f);
-						const float WidthBasedCap = AvgRoadwayHalfWidth * 2.f;
 						const float ShorterFlankingLength = FMath::Min(Approaches[A.ApproachIndex].ArcLengthTable.GetTotalLength(), Approaches[B.ApproachIndex].ArcLengthTable.GetTotalLength());
 						const float LengthBasedCap = FMath::Max(ShorterFlankingLength * 0.45f, 1.f);
-						const float MaxTangentDist = FMath::Min(WidthBasedCap, LengthBasedCap);
+						// Acute turns legitimately need a long setback. The usable 45% of the shorter
+						// approach is the real constraint; road width is not an availability limit.
+						const float MaxTangentDist = LengthBasedCap;
 						const float TanHalfTheta = FMath::Tan(HalfTheta);
 						if (TanHalfTheta > KINDA_SMALL_NUMBER && EffectiveCurbRadius / TanHalfTheta > MaxTangentDist)
 						{
@@ -320,20 +384,17 @@ namespace
 				// as the curb-return fillet did, and a near-parallel pair gated out of curb-return
 				// above (or simply two roads with no sidewalks meeting at a shallow angle) is
 				// exactly the input that sends that arbitrarily far out. Cap how far either is
-				// allowed to reach the same way the curb-return path is capped, falling back to the
-				// simple midpoint (bounded by construction, however tight the angle) when neither
-				// fits -- this is what stops a shallow-angle corner from producing the long
-				// stretched-out polygon tip that left the rest of the junction mesh not generated.
+				// allowed to reach using the actual available flanking-road length. If neither fits,
+				// the bounded sharp bevel below still connects both curb mouths without an unbounded
+				// spike; the final hull fallback guarantees a surface even for a pathological ring.
 				float MaxCornerReach = TNumericLimits<float>::Max();
 				{
 					const float HalfTheta = FMath::Acos(CosTheta) * 0.5f;
 					if (HalfTheta > KINDA_SMALL_NUMBER)
 					{
-						const float AvgOuterExtent = FMath::Max((A.OuterExtent + B.OuterExtent) * 0.5f, 1.f);
-						const float WidthBasedCap = AvgOuterExtent * 3.f;
 						const float ShorterFlankingLength = FMath::Min(Approaches[A.ApproachIndex].ArcLengthTable.GetTotalLength(), Approaches[B.ApproachIndex].ArcLengthTable.GetTotalLength());
 						const float LengthBasedCap = FMath::Max(ShorterFlankingLength * 0.45f, 1.f);
-						MaxCornerReach = FMath::Min(WidthBasedCap, LengthBasedCap);
+						MaxCornerReach = LengthBasedCap;
 					}
 				}
 
@@ -386,14 +447,27 @@ namespace
 					}
 					else
 					{
-						// Directions are (nearly) collinear, or even the fillet would reach too far --
-						// nothing sensible to round; fall back to the simple offset corner (bounded by
-						// construction, roughly OuterExtent regardless of angle) so the polygon still
-						// closes without an unbounded spike.
-						const FVector2D Fallback = (OriginA + OriginB) * 0.5f;
-						UpdateTrim(A.ApproachIndex, Fallback, FVector2D::ZeroVector, A.Direction2D);
-						UpdateTrim(B.ApproachIndex, Fallback, FVector2D::ZeroVector, B.Direction2D);
-						CornerPoints = { Fallback };
+						// A sharp/acute turn can put the theoretical miter far beyond the usable
+						// intersection footprint. Preserve the turn as a bounded sharp bevel instead
+						// of collapsing both curb edges to one midpoint (which pinched the surface and
+						// could leave one approach uncovered). Each endpoint stays on its own curb ray.
+						FVector2D SharpIntersection;
+						float ReachA = 0.f;
+						float ReachB = 0.f;
+						if (FlexGeometry2D::LineLineIntersection(OriginA, A.Direction2D, OriginB, B.Direction2D, SharpIntersection))
+						{
+							ReachA = FMath::Clamp(FVector2D::DotProduct(SharpIntersection - OriginA, A.Direction2D), 0.f, MaxCornerReach);
+							ReachB = FMath::Clamp(FVector2D::DotProduct(SharpIntersection - OriginB, B.Direction2D), 0.f, MaxCornerReach);
+						}
+						const FVector2D BevelA = OriginA + A.Direction2D * ReachA;
+						const FVector2D BevelB = OriginB + B.Direction2D * ReachB;
+						UpdateTrim(A.ApproachIndex, BevelA, FVector2D::ZeroVector, A.Direction2D);
+						UpdateTrim(B.ApproachIndex, BevelB, FVector2D::ZeroVector, B.Direction2D);
+						CornerPoints.Add(BevelA);
+						if (!BevelA.Equals(BevelB, KINDA_SMALL_NUMBER))
+						{
+							CornerPoints.Add(BevelB);
+						}
 					}
 				}
 			}
@@ -571,6 +645,11 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 	// Fast path: the configured CurbReturnRadius works as-is (the overwhelmingly common case for
 	// reasonably-spaced intersections).
 	FJunctionCornerBuildResult CornerResult = TryRadius(CurbReturnRadius);
+	// Keep the full-radius sidewalk returns available for the hull fallback. Polygon validity is a
+	// ring-order problem; each individual return can still be valid and is needed to bridge the
+	// longer acute-angle road cuts smoothly.
+	const TArray<FFlexJunctionCornerIsland> FullRadiusCornerIslands = CornerResult.CornerIslands;
+	const TMap<int32, float> FullRadiusTrimDistances = CornerResult.TrimDistance2DByApproachIndex;
 	if (!IsValidResult(CornerResult))
 	{
 		// It doesn't -- even an ordinary symmetric 90-degree 4-way at default settings can
@@ -607,13 +686,24 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 		}
 		else
 		{
-			// Even fully collapsed to sharp corners this node self-intersects -- a rare, very
-			// tight cluster of approaches crammed into a narrow angular wedge, which the sharp-
-			// corner fallback has no cap against either. No radius can fix that; keep this result
-			// as-is and let the simple-polygon/triangulation guards below discard the drivable
-			// surface gracefully rather than claim a guarantee that doesn't actually hold here.
+			// Preserve the zero-radius attempt's useful per-approach trims and sidewalk returns;
+			// its invalid detailed ring is replaced by the guaranteed-simple mouth hull below.
 			CornerResult = MoveTemp(ZeroResult);
 		}
+	}
+
+	if (!IsValidResult(CornerResult))
+	{
+		CornerResult.CornerIslands = FullRadiusCornerIslands;
+		for (const TPair<int32, float>& Pair : FullRadiusTrimDistances)
+		{
+			float& Trim = CornerResult.TrimDistance2DByApproachIndex.FindOrAdd(Pair.Key, 0.f);
+			Trim = FMath::Max(Trim, Pair.Value);
+		}
+		CornerResult.Polygon2D.Reset();
+		CornerResult.Polygon2DEdgeIsCurbLine.Reset();
+		BuildApproachMouthHull(Sorted, Approaches, CornerResult.TrimDistance2DByApproachIndex,
+			CornerResult.Polygon2D, CornerResult.Polygon2DEdgeIsCurbLine);
 	}
 
 	TArray<FVector2D> Polygon2D = MoveTemp(CornerResult.Polygon2D);
@@ -749,9 +839,14 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 			}
 
 			const float Dist = FVector::Dist(In.Position, Out.Position);
-			// A longer handle (relative to the classic Dist/3 rule of thumb) sweeps the connector
-			// through a wider, smoother turn instead of cutting a tight corner across the junction.
-			const float HandleLength = FMath::Max(Dist * 0.45f, 1.f);
+			const float DirectionDot = FMath::Clamp(FVector::DotProduct(In.Tangent.GetSafeNormal(), Out.Tangent.GetSafeNormal()), -1.f, 1.f);
+			const float TurnAngleDegrees = FMath::RadiansToDegrees(FMath::Acos(DirectionDot));
+			// Straight movements keep long handles for a broad smooth sweep. Tight turns shorten
+			// progressively so their control points remain inside the junction rather than crossing
+			// the opposite curb or producing a loop at acute intersections.
+			const float Sharpness = FMath::Clamp(TurnAngleDegrees / 180.f, 0.f, 1.f);
+			const float HandleScale = FMath::Lerp(0.45f, 0.18f, Sharpness);
+			const float HandleLength = FMath::Max(Dist * HandleScale, 1.f);
 
 			FFlexLaneConnector Connector;
 			Connector.FromSegment = Approaches[In.ApproachIndex].SegmentId;
@@ -763,6 +858,8 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 			Connector.ConnectorCurve.P2 = Out.Position - Out.Tangent * HandleLength;
 			Connector.ConnectorCurve.P3 = Out.Position;
 			Connector.SpeedLimit = FMath::Min(In.SpeedLimit, Out.SpeedLimit);
+			Connector.TurnAngleDegrees = TurnAngleDegrees;
+			Connector.bSharpTurn = TurnAngleDegrees >= 100.f;
 			Result.LaneConnectors.Add(Connector);
 		}
 	}

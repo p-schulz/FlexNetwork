@@ -23,6 +23,13 @@ class UFlexNetworkEdModeSettings : public UObject
 	GENERATED_BODY()
 
 public:
+	/** Selects the transient output maintained for both hand-drawn and OSM-imported segments. */
+	UPROPERTY(EditAnywhere, Category = "FlexNetwork", meta = (DisplayPriority = "0"))
+	EFlexNetworkVisualizationMode VisualizationMode = EFlexNetworkVisualizationMode::GeneratedGeometry;
+
+#if WITH_EDITOR
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
 	/**
 	 * When on: click once to place/continue a road's start point, move the mouse to preview,
 	 * click again to commit the segment (like the Landscape Splines "Add Control Point" tool).
@@ -55,6 +62,10 @@ public:
 	UFUNCTION(CallInEditor, Category = "OSM Import", meta = (DisplayName = "Generate Roads From OSM"))
 	void GenerateRoadsFromOsm();
 
+	/** Rebuilds every road, sidewalk, junction and segment visualization from authoritative graph data. */
+	UFUNCTION(CallInEditor, Category = "FlexNetwork", meta = (DisplayName = "Rebuild All Network Geometry"))
+	void RebuildAllNetworkGeometry();
+
 	/** Flattens/blends the landscape under every Ground road to match the road's height (Bridge/Elevated/Tunnel/Ramp roads are left alone). Forces a re-apply even for roads that weren't just edited -- e.g. after hand-sculpting the landscape since the last change. */
 	UFUNCTION(CallInEditor, Category = "Terrain", meta = (DisplayName = "Conform Terrain To Roads"))
 	void ConformTerrainToRoads();
@@ -69,6 +80,9 @@ public:
 
 	UPROPERTY(EditAnywhere, Category = "Materials")
 	TObjectPtr<UMaterialInterface> StandardSidewalkMaterial;
+
+	UPROPERTY(EditAnywhere, Category = "Materials")
+	TObjectPtr<UMaterialInterface> StandardCrosswalkMaterial;
 
 	UPROPERTY(EditAnywhere, Category = "Materials")
 	TObjectPtr<UMaterialInterface> StandardJunctionMaterial;
