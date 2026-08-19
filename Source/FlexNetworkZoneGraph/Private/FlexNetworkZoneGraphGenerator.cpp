@@ -277,24 +277,29 @@ namespace
 			return Result;
 		}
 
-		const int32 ForwardVehicleLaneCount = Profile.Lanes.CountByPredicate([](const FRoadLaneDescriptor& Lane)
-		{
-			return Lane.Type == EFlexLaneType::Vehicle && Lane.Direction == EFlexLaneDirection::Forward;
-		});
-		const int32 BackwardVehicleLaneCount = Profile.Lanes.CountByPredicate([](const FRoadLaneDescriptor& Lane)
-		{
-			return Lane.Type == EFlexLaneType::Vehicle && Lane.Direction == EFlexLaneDirection::Backward;
-		});
-		const int32 BidirectionalVehicleLaneCount = Profile.Lanes.CountByPredicate([](const FRoadLaneDescriptor& Lane)
-		{
-			return Lane.Type == EFlexLaneType::Vehicle && Lane.Direction == EFlexLaneDirection::Bidirectional;
-		});
+		int32 ForwardVehicleLaneCount = 0;
+		int32 BackwardVehicleLaneCount = 0;
+		int32 BidirectionalVehicleLaneCount = 0;
 		float MaximumVehicleSpeed = 0.f;
 		for (const FRoadLaneDescriptor& Lane : Profile.Lanes)
 		{
 			if (Lane.Type == EFlexLaneType::Vehicle)
 			{
 				MaximumVehicleSpeed = FMath::Max(MaximumVehicleSpeed, Lane.SpeedLimit);
+				switch (Lane.Direction)
+				{
+				case EFlexLaneDirection::Forward:
+					++ForwardVehicleLaneCount;
+					break;
+				case EFlexLaneDirection::Backward:
+					++BackwardVehicleLaneCount;
+					break;
+				case EFlexLaneDirection::Bidirectional:
+					++BidirectionalVehicleLaneCount;
+					break;
+				default:
+					break;
+				}
 			}
 		}
 		const bool bTrunk = IsTrunkProfile(Profile, MaximumVehicleSpeed);

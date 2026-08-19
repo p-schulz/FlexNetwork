@@ -1274,7 +1274,7 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 		FFlexSegmentId SegmentId;
 		FFlexNodeId StartNodeId;
 		FFlexNodeId EndNodeId;
-		TObjectPtr<URoadTypeProfile> Profile = nullptr;
+		URoadTypeProfile* Profile = nullptr;
 	};
 	TArray<FImportedWaySegment> ImportedWaySegments;
 
@@ -1455,8 +1455,26 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 	// two adjacent directed segments with the original outer Bezier handles, which keeps each
 	// portal's authored heading while eliminating visual/routing control points in the asphalt
 	// interior. Nodes where way direction or profile changes are deliberately retained.
+	TSet<int32> TrafficControlRoots;
+	if (Settings.bImportTrafficControls)
+	{
+		for (int32 NodeIndex = 0; NodeIndex < RelevantNodeIds.Num(); ++NodeIndex)
+		{
+			EFlexTrafficControlType UnusedType;
+			if (GetTrafficControlType(OsmAsset.Nodes.FindChecked(RelevantNodeIds[NodeIndex]), UnusedType))
+			{
+				TrafficControlRoots.Add(UnionFind.Find(NodeIndex));
+			}
+		}
+	}
 	for (const int32 ShapeRoot : ComplexIntersectionInteriorShapeRoots)
 	{
+		if (TrafficControlRoots.Contains(ShapeRoot))
+		{
+			// Stop lines are meaningful routing portals. Removing this degree-2 node would
+			// destroy both its physical anchor and the heading MassTraffic must match.
+			continue;
+		}
 		const int32 FinalRoot = FinalUnionFind.Find(ShapeRoot);
 		const FFlexNodeId* ShapeNodeIdPtr = ClusterToFlexNode.Find(FinalRoot);
 		const FFlexRoadNode* ShapeNode = ShapeNodeIdPtr ? Subsystem.GetNode(*ShapeNodeIdPtr) : nullptr;
@@ -1492,13 +1510,51 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 		URoadTypeProfile* Profile = Incoming->Profile.Get();
 		const EFlexRoadElevationType ElevationType = Incoming->ElevationType;
 		const FFlexElevationProfile ElevationProfile = Incoming->ElevationProfile;
+		FImportedWaySegment IncomingRecord;
+		FImportedWaySegment OutgoingRecord;
+		bool bHasIncomingRecord = false;
+		bool bHasOutgoingRecord = false;
+		for (const FImportedWaySegment& Record : ImportedWaySegments)
+		{
+			if (Record.SegmentId == IncomingId)
+			{
+				IncomingRecord = Record;
+				bHasIncomingRecord = true;
+			}
+			if (Record.SegmentId == OutgoingId)
+			{
+				OutgoingRecord = Record;
+				bHasOutgoingRecord = true;
+			}
+		}
 		if (!Subsystem.RemoveSegment(IncomingId) || !Subsystem.RemoveSegment(OutgoingId)
-			|| !Subsystem.RemoveNode(*ShapeNodeIdPtr)
-			|| !Subsystem.AddSegment(StartNodeId, EndNodeId, StartHandle, EndHandle, Profile,
-				ElevationType, ElevationProfile).IsValid())
+			|| !Subsystem.RemoveNode(*ShapeNodeIdPtr))
 		{
 			Result.Warnings.Add(TEXT("Could not simplify one complex-intersection interior shape node."));
 			continue;
+		}
+		const FFlexSegmentId JoinedSegmentId = Subsystem.AddSegment(StartNodeId, EndNodeId,
+			StartHandle, EndHandle, Profile, ElevationType, ElevationProfile);
+		if (!JoinedSegmentId.IsValid())
+		{
+			Result.Warnings.Add(TEXT("Could not join one complex-intersection interior shape path."));
+			continue;
+		}
+		ImportedWaySegments.RemoveAll([IncomingId, OutgoingId](const FImportedWaySegment& Record)
+		{
+			return Record.SegmentId == IncomingId || Record.SegmentId == OutgoingId;
+		});
+		if (bHasIncomingRecord && bHasOutgoingRecord
+			&& IncomingRecord.WayId == OutgoingRecord.WayId)
+		{
+			FImportedWaySegment& JoinedRecord = ImportedWaySegments.AddDefaulted_GetRef();
+			JoinedRecord.WayId = IncomingRecord.WayId;
+			JoinedRecord.StartOsmNodeId = IncomingRecord.StartOsmNodeId;
+			JoinedRecord.EndOsmNodeId = OutgoingRecord.EndOsmNodeId;
+			JoinedRecord.SegmentId = JoinedSegmentId;
+			JoinedRecord.StartNodeId = StartNodeId;
+			JoinedRecord.EndNodeId = EndNodeId;
+			JoinedRecord.Profile = Profile;
 		}
 		ClusterToFlexNode.Remove(FinalRoot);
 		--Result.NumNodesCreated;
@@ -1527,9 +1583,9 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 
 	// OSM point controls become directed records attached to the exact imported approach. Missing
 	// direction means both way directions, represented as separate records so MassTraffic can
-	// associate each one with one inbound ZoneGraph side. Records whose short source segment was
-	// consumed while simplifying a complex-intersection interior are intentionally skipped; those
-	// points sit inside the shared surface rather than at a valid stop portal.
+	// associate each one with one inbound ZoneGraph side. Tagged stop-line nodes are retained during
+	// complex-intersection simplification, and the physical anchor is allowed to differ from the
+	// final controlled approach when the stop line lies before the topology junction.
 	if (Settings.bImportTrafficControls)
 	{
 		TSet<FString> ImportedControlKeys;
@@ -1539,6 +1595,19 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 			if (!Segment || !Imported.Profile || Imported.Profile->bIsRailProfile)
 			{
 				continue;
+			}
+			bool bHasForwardTraffic = false;
+			bool bHasBackwardTraffic = false;
+			for (const FRoadLaneDescriptor& Lane : Imported.Profile->Lanes)
+			{
+				if (Lane.Type != EFlexLaneType::Vehicle)
+				{
+					continue;
+				}
+				bHasForwardTraffic |= Lane.Direction == EFlexLaneDirection::Forward
+					|| Lane.Direction == EFlexLaneDirection::Bidirectional;
+				bHasBackwardTraffic |= Lane.Direction == EFlexLaneDirection::Backward
+					|| Lane.Direction == EFlexLaneDirection::Bidirectional;
 			}
 
 			auto AddEndpointControl = [&](const int64 OsmNodeId, const bool bForward,
@@ -1550,6 +1619,56 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 					|| !TrafficControlAppliesToWayDirection(*OsmNode, bForward))
 				{
 					return;
+				}
+
+				FFlexSegmentId ControlledApproachId = Imported.SegmentId;
+				FFlexNodeId ControlledJunctionId = JunctionNodeId;
+				auto IsJunctionPortal = [&Subsystem](const FFlexNodeId NodeId)
+				{
+					const FFlexRoadNode* Node = Subsystem.GetNode(NodeId);
+					return Node && Node->ConnectedSegments.Num() >= 3;
+				};
+				// A traffic_signals node may mark a stop line before the actual topology node. Keep
+				// the physical anchor here, but walk the same OSM way in the controlled travel
+				// direction and bind MassTraffic to the final inbound segment at the next portal.
+				if (!IsJunctionPortal(ControlledJunctionId))
+				{
+					int64 CursorOsmNodeId = OsmNodeId;
+					TSet<int64> VisitedOsmNodes;
+					VisitedOsmNodes.Add(CursorOsmNodeId);
+					for (int32 Step = 0; Step < 64; ++Step)
+					{
+						const FImportedWaySegment* Next = nullptr;
+						for (const FImportedWaySegment& Candidate : ImportedWaySegments)
+						{
+							if (Candidate.WayId != Imported.WayId || !Subsystem.GetSegment(Candidate.SegmentId))
+							{
+								continue;
+							}
+							if ((bForward && Candidate.StartOsmNodeId == CursorOsmNodeId)
+								|| (!bForward && Candidate.EndOsmNodeId == CursorOsmNodeId))
+							{
+								Next = &Candidate;
+								break;
+							}
+						}
+						if (!Next)
+						{
+							break;
+						}
+						ControlledApproachId = Next->SegmentId;
+						ControlledJunctionId = bForward ? Next->EndNodeId : Next->StartNodeId;
+						CursorOsmNodeId = bForward ? Next->EndOsmNodeId : Next->StartOsmNodeId;
+						if (IsJunctionPortal(ControlledJunctionId))
+						{
+							break;
+						}
+						if (VisitedOsmNodes.Contains(CursorOsmNodeId))
+						{
+							break;
+						}
+						VisitedOsmNodes.Add(CursorOsmNodeId);
+					}
 				}
 
 				const FString DirectionName = bForward ? TEXT("forward") : TEXT("backward");
@@ -1564,8 +1683,8 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 				Signal.Type = Type;
 				Signal.AnchorSegmentId = Imported.SegmentId;
 				Signal.AnchorFraction = AnchorFraction;
-				Signal.ControlledApproachSegmentId = Imported.SegmentId;
-				Signal.ControlledJunctionNodeId = JunctionNodeId;
+				Signal.ControlledApproachSegmentId = ControlledApproachId;
+				Signal.ControlledJunctionNodeId = ControlledJunctionId;
 				Signal.LateralOffset = (bForward
 					? Imported.Profile->GetRoadwayMaxOffset()
 					: -Imported.Profile->GetRoadwayMinOffset())
@@ -1579,8 +1698,14 @@ FFlexOsmGraphBuilder::FImportResult FFlexOsmGraphBuilder::BuildFromOsm(UFlexNetw
 			};
 
 			// Forward traffic reaches the segment's end; backward traffic reaches its start.
-			AddEndpointControl(Imported.EndOsmNodeId, true, Imported.EndNodeId, 1.f);
-			AddEndpointControl(Imported.StartOsmNodeId, false, Imported.StartNodeId, 0.f);
+			if (bHasForwardTraffic)
+			{
+				AddEndpointControl(Imported.EndOsmNodeId, true, Imported.EndNodeId, 1.f);
+			}
+			if (bHasBackwardTraffic)
+			{
+				AddEndpointControl(Imported.StartOsmNodeId, false, Imported.StartNodeId, 0.f);
+			}
 		}
 	}
 

@@ -62,11 +62,21 @@ int32 AFlexNetworkBakeActor::CaptureFromSubsystem(const UFlexNetworkSubsystem& S
 		BakedSegments.Add(MoveTemp(Record));
 	}
 
-	BakedTrafficSignals.Reserve(Subsystem.GetAllTrafficSignals().Num());
+	TArray<const FFlexTrafficSignal*> OrderedSignals;
+	OrderedSignals.Reserve(Subsystem.GetAllTrafficSignals().Num());
 	for (const TPair<FGuid, FFlexTrafficSignal>& Pair : Subsystem.GetAllTrafficSignals())
 	{
+		OrderedSignals.Add(&Pair.Value);
+	}
+	OrderedSignals.Sort([](const FFlexTrafficSignal& A, const FFlexTrafficSignal& B)
+	{
+		return A.Id < B.Id;
+	});
+	BakedTrafficSignals.Reserve(OrderedSignals.Num());
+	for (const FFlexTrafficSignal* Signal : OrderedSignals)
+	{
 		FFlexBakedTrafficSignal Record;
-		Record.Signal = Pair.Value;
+		Record.Signal = *Signal;
 		BakedTrafficSignals.Add(MoveTemp(Record));
 	}
 

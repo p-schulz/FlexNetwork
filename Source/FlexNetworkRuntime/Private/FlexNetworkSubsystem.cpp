@@ -14,6 +14,7 @@
 #include "Terrain/FlexLandscapeConformer.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "Math/RotationMatrix.h"
 
 namespace
 {
@@ -572,6 +573,19 @@ FGuid UFlexNetworkSubsystem::AddTrafficSignal(const FFlexTrafficSignal& InSignal
 	}
 	FFlexTrafficSignal Signal = InSignal;
 	Signal.AnchorFraction = FMath::Clamp(Signal.AnchorFraction, 0.f, 1.f);
+	if (!Signal.SourceId.IsEmpty())
+	{
+		for (TPair<FGuid, FFlexTrafficSignal>& Pair : TrafficSignals)
+		{
+			if (Pair.Value.SourceId == Signal.SourceId)
+			{
+				Signal.Id = Pair.Key;
+				Pair.Value = MoveTemp(Signal);
+				BroadcastTrafficSignalsChanged();
+				return Pair.Key;
+			}
+		}
+	}
 	if (!Signal.Id.IsValid())
 	{
 		Signal.Id = FGuid::NewGuid();
@@ -636,9 +650,16 @@ bool UFlexNetworkSubsystem::ResolveTrafficSignal(const FFlexTrafficSignal& Signa
 	const FVector Inbound = (bJunctionAtStart ? -ApproachFrame.Tangent : ApproachFrame.Tangent)
 		.GetSafeNormal(UE_SMALL_NUMBER, FVector::ForwardVector);
 	const FVector Up = AnchorFrame.Up.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
-	const FVector InboundRight = FVector::CrossProduct(Up, Inbound)
+	FVector AnchorInbound = AnchorFrame.Tangent.GetSafeNormal(UE_SMALL_NUMBER, Inbound);
+	if (FVector::DotProduct(AnchorInbound, Inbound) < 0.f)
+	{
+		AnchorInbound *= -1.f;
+	}
+	const FVector AnchorInboundRight = FVector::CrossProduct(Up, AnchorInbound)
 		.GetSafeNormal(UE_SMALL_NUMBER, AnchorFrame.Right);
-	const FVector Position = AnchorFrame.Position + InboundRight * Signal.LateralOffset + Up * Signal.HeightOffset;
+	const FVector Position = AnchorFrame.Position + AnchorInboundRight * Signal.LateralOffset + Up * Signal.HeightOffset;
+	const FVector ApproachInboundRight = FVector::CrossProduct(ApproachFrame.Up, Inbound)
+		.GetSafeNormal(UE_SMALL_NUMBER, ApproachFrame.Right);
 
 	float TrimStart = 0.f;
 	float TrimEnd = Approach.GetLength();
@@ -649,10 +670,33 @@ bool UFlexNetworkSubsystem::ResolveTrafficSignal(const FFlexTrafficSignal& Signa
 	{
 		SideFrame.Position += SideFrame.Right * Approach.Profile->GetRoadwayCenterOffset();
 	}
+	FVector ControlledSidePoint = SideFrame.Position;
+	if (const FFlexJunctionData* Junction = JunctionDataByNode.Find(Signal.ControlledJunctionNodeId))
+	{
+		// MassTraffic searches from the left-most inbound intersection lane. Use the matching
+		// connector start exactly when available, rather than relying on a road-center midpoint
+		// whose lateral error can exceed the default 400 cm search radius on a wide arterial.
+		bool bFoundInboundLane = false;
+		float LeftMostOffset = TNumericLimits<float>::Max();
+		for (const FFlexLaneConnector& Connector : Junction->LaneConnectors)
+		{
+			if (Connector.FromSegment != Signal.ControlledApproachSegmentId)
+			{
+				continue;
+			}
+			const float Offset = FVector::DotProduct(Connector.ConnectorCurve.P0 - SideFrame.Position, ApproachInboundRight);
+			if (!bFoundInboundLane || Offset < LeftMostOffset)
+			{
+				bFoundInboundLane = true;
+				LeftMostOffset = Offset;
+				ControlledSidePoint = Connector.ConnectorCurve.P0;
+			}
+		}
+	}
 
 	OutResolved.InboundDirection = Inbound;
-	OutResolved.ControlledIntersectionSideMidpoint = SideFrame.Position;
-	OutResolved.Transform = FTransform(FRotationMatrix::MakeFromXZ(Inbound, Up).ToQuat(), Position);
+	OutResolved.ControlledIntersectionSideMidpoint = ControlledSidePoint;
+	OutResolved.Transform = FTransform(FRotationMatrix::MakeFromXZ(AnchorInbound, Up).ToQuat(), Position);
 	return true;
 }
 

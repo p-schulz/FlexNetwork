@@ -67,8 +67,9 @@ FFlexMassSignalExportResult FFlexNetworkMassSignalExporter::GenerateOrUpdate(
 	{
 		AssetName = TEXT("DA_FlexNetworkTrafficLights");
 	}
-	for (TCHAR& Character : AssetName)
+	for (int32 Index = 0; Index < AssetName.Len(); ++Index)
 	{
+		TCHAR& Character = AssetName[Index];
 		if (!FChar::IsAlnum(Character) && Character != TEXT('_'))
 		{
 			Character = TEXT('_');
@@ -104,9 +105,22 @@ FFlexMassSignalExportResult FFlexNetworkMassSignalExporter::GenerateOrUpdate(
 	Instances->TrafficLightTypesData = Types;
 	Instances->TrafficLights.Reset();
 
+	TArray<const FFlexTrafficSignal*> OrderedSignals;
+	OrderedSignals.Reserve(Network.GetAllTrafficSignals().Num());
 	for (const TPair<FGuid, FFlexTrafficSignal>& Pair : Network.GetAllTrafficSignals())
 	{
-		const FFlexTrafficSignal& Signal = Pair.Value;
+		OrderedSignals.Add(&Pair.Value);
+	}
+	OrderedSignals.Sort([](const FFlexTrafficSignal& A, const FFlexTrafficSignal& B)
+	{
+		const FString AKey = A.SourceId.IsEmpty() ? A.Id.ToString() : A.SourceId;
+		const FString BKey = B.SourceId.IsEmpty() ? B.Id.ToString() : B.SourceId;
+		return AKey < BKey;
+	});
+
+	for (const FFlexTrafficSignal* SignalPtr : OrderedSignals)
+	{
+		const FFlexTrafficSignal& Signal = *SignalPtr;
 		if (Signal.Type != EFlexTrafficControlType::TrafficLight || !Signal.bEnabled)
 		{
 			continue;
