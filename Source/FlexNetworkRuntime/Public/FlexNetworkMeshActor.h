@@ -42,6 +42,7 @@ public:
 	 * spline's forward direction. A no-op (just clears existing curbstones) if Mesh is null.
 	 */
 	void ApplyCurbstones(const TArray<TArray<FVector>>& CurbLines, UStaticMesh* Mesh);
+	UStaticMesh* GetAppliedCurbstoneMesh() const { return AppliedCurbstoneMesh.Get(); }
 
 	void ClearAll();
 
@@ -62,6 +63,10 @@ private:
 
 	UPROPERTY()
 	TArray<TObjectPtr<USplineMeshComponent>> CurbstoneComponents;
+
+	/** Last explicitly generated curbstone source, retained so a network bake can reproduce it. */
+	UPROPERTY()
+	TObjectPtr<UStaticMesh> AppliedCurbstoneMesh;
 
 	UProceduralMeshComponent* GetOrCreateComponent(TMap<FFlexSegmentId, TObjectPtr<UProceduralMeshComponent>>& Map, FFlexSegmentId Id, const TCHAR* NamePrefix);
 	UProceduralMeshComponent* GetOrCreateComponent(TMap<FFlexNodeId, TObjectPtr<UProceduralMeshComponent>>& Map, FFlexNodeId Id, const TCHAR* NamePrefix);

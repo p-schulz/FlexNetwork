@@ -49,6 +49,9 @@ namespace
 		float Angle = 0.f;
 		float OuterExtent = 0.f;
 		float RoadwayHalfWidth = 0.f;
+		/** Signed roadway-center offset to the right of this approach's outward direction. */
+		float RoadwayCenterOffset = 0.f;
+		float RoadwayMaxExtent = 0.f;
 		float SidewalkWidth = 0.f;
 		float CurbHeight = 0.f;
 	};
@@ -145,11 +148,12 @@ namespace
 			const float Available = Approaches.IsValidIndex(Entry.ApproachIndex)
 				? Approaches[Entry.ApproachIndex].ArcLengthTable.GetTotalLength() * 0.45f : 0.f;
 			float& Trim = InOutTrimDistance.FindOrAdd(Entry.ApproachIndex, Entry.OuterExtent);
-			Trim = FMath::Clamp(FMath::Max(Trim, Entry.RoadwayHalfWidth), 0.f, Available);
+			Trim = FMath::Clamp(FMath::Max(Trim, Entry.RoadwayMaxExtent), 0.f, Available);
 			const FVector2D Left(-Entry.Direction2D.Y, Entry.Direction2D.X);
+			const FVector2D Right(Entry.Direction2D.Y, -Entry.Direction2D.X);
 			const FVector2D Center = Entry.Direction2D * Trim;
-			Points.Add({ Center + Left * Entry.RoadwayHalfWidth, Entry.ApproachIndex });
-			Points.Add({ Center - Left * Entry.RoadwayHalfWidth, Entry.ApproachIndex });
+			Points.Add({ Center + Left * (Entry.RoadwayHalfWidth - Entry.RoadwayCenterOffset), Entry.ApproachIndex });
+			Points.Add({ Center + Right * (Entry.RoadwayHalfWidth + Entry.RoadwayCenterOffset), Entry.ApproachIndex });
 		}
 		Points.Sort([](const FHullPoint& A, const FHullPoint& B)
 		{
@@ -234,8 +238,8 @@ namespace
 			// sidewalk needs to sit, and -- since a neighboring corner at the same node might still
 			// be using the narrower curb-return boundary -- produced a mismatched, notched edge
 			// between the two reference widths at the node where they met.
-			const FVector2D OriginA = RightPerpA * A.RoadwayHalfWidth;
-			const FVector2D OriginB = LeftPerpB * B.RoadwayHalfWidth;
+			const FVector2D OriginA = RightPerpA * (A.RoadwayHalfWidth + A.RoadwayCenterOffset);
+			const FVector2D OriginB = LeftPerpB * (B.RoadwayHalfWidth - B.RoadwayCenterOffset);
 
 			bool bBuiltPolygonCorner = false;
 			// This pair's raw (unclipped) contribution to the drivable ring, ordered from the
@@ -279,8 +283,8 @@ namespace
 				// as everywhere else the pavement/sidewalk edge sits.
 				const FVector2D LeftPerpA(-A.Direction2D.Y, A.Direction2D.X);
 				const FVector2D RightPerpB(B.Direction2D.Y, -B.Direction2D.X);
-				const FVector2D NearOriginA = LeftPerpA * A.RoadwayHalfWidth;
-				const FVector2D NearOriginB = RightPerpB * B.RoadwayHalfWidth;
+				const FVector2D NearOriginA = LeftPerpA * (A.RoadwayHalfWidth - A.RoadwayCenterOffset);
+				const FVector2D NearOriginB = RightPerpB * (B.RoadwayHalfWidth + B.RoadwayCenterOffset);
 				FVector2D NearCornerRef;
 				if (!FlexGeometry2D::LineLineIntersection(NearOriginA, A.Direction2D, NearOriginB, B.Direction2D, NearCornerRef))
 				{
@@ -631,6 +635,10 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 		Entry.Angle = FMath::Atan2(Entry.Direction2D.Y, Entry.Direction2D.X);
 		Entry.OuterExtent = Approaches[i].Profile ? Approaches[i].Profile->GetOuterExtent() : 0.f;
 		Entry.RoadwayHalfWidth = Approaches[i].Profile ? Approaches[i].Profile->GetRoadwayHalfWidth() : 0.f;
+		Entry.RoadwayCenterOffset = Approaches[i].Profile
+			? Approaches[i].Profile->GetRoadwayCenterOffset() * (Approaches[i].bNodeIsSegmentEnd ? -1.f : 1.f)
+			: 0.f;
+		Entry.RoadwayMaxExtent = Entry.RoadwayHalfWidth + FMath::Abs(Entry.RoadwayCenterOffset);
 		Entry.SidewalkWidth = Approaches[i].Profile ? Approaches[i].Profile->SidewalkWidth : 0.f;
 		Entry.CurbHeight = Approaches[i].Profile ? Approaches[i].Profile->CurbHeight : 0.f;
 		Sorted.Add(Entry);
@@ -705,6 +713,22 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 		BuildApproachMouthHull(Sorted, Approaches, CornerResult.TrimDistance2DByApproachIndex,
 			CornerResult.Polygon2D, CornerResult.Polygon2DEdgeIsCurbLine);
 	}
+	if (N >= 6)
+	{
+		// A consolidated complex OSM intersection commonly exposes two carriageway approaches
+		// per physical road, producing 6-10 angular entries at one logical node. Even when the
+		// pairwise curb-return ring is technically simple, its alternating near-parallel wedges
+		// can carve deep notches between carriageways. Those notches become road holes and exposed
+		// boundaries, which the unified pass then correctly-but-undesirably turns into sidewalks.
+		// Use the guaranteed-simple convex mouth hull for this topology: it fills the complete
+		// intersection interior, retains the computed per-approach cuts, and leaves sidewalk
+		// generation only on the hull's genuinely exposed outside boundary.
+		CornerResult.Polygon2D.Reset();
+		CornerResult.Polygon2DEdgeIsCurbLine.Reset();
+		BuildApproachMouthHull(Sorted, Approaches, CornerResult.TrimDistance2DByApproachIndex,
+			CornerResult.Polygon2D, CornerResult.Polygon2DEdgeIsCurbLine);
+		CornerResult.CornerIslands.Reset();
+	}
 
 	TArray<FVector2D> Polygon2D = MoveTemp(CornerResult.Polygon2D);
 	TMap<int32, float> TrimDistance2DByApproachIndex = MoveTemp(CornerResult.TrimDistance2DByApproachIndex);
@@ -771,10 +795,11 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 			const FFlexCurveFrame Frame = FFlexRoadMeshBuilder::SampleFrameAtArcLength(Approach.Curve, Approach.ArcLengthTable, Approach.bNodeIsSegmentEnd ? SegmentLength - ClearedDistance2D : ClearedDistance2D, NodeUp);
 
 			FFlexCrosswalkPlacement Crosswalk;
-			Crosswalk.Center = Frame.Position;
+			Crosswalk.SegmentId = Approach.SegmentId;
+			Crosswalk.Center = Frame.Position + Frame.Right * Approach.Profile->GetRoadwayCenterOffset();
 			Crosswalk.CrossingDirection = Frame.Right;
 			Crosswalk.Width = CrosswalkWidth;
-			Crosswalk.Length = Approach.Profile->GetRoadwayHalfWidth() * 2.f;
+			Crosswalk.Length = Approach.Profile->GetRoadwayWidth();
 			Result.Crosswalks.Add(Crosswalk);
 		}
 	}
@@ -787,6 +812,7 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 		FVector Position;
 		FVector Tangent; // direction of travel at this connector endpoint
 		float SpeedLimit;
+		EFlexLaneType Type;
 	};
 	TArray<FResolvedLane> IncomingLanes;
 	TArray<FResolvedLane> OutgoingLanes;
@@ -814,15 +840,15 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 				continue;
 			}
 
-			const FVector LanePos = Frame.Position + Frame.Right * Lanes[LaneIndex].LateralOffset;
+			const FVector LanePos = Frame.Position + Frame.Right * Approach.Profile->GetLaneLateralOffset(Lanes[LaneIndex]);
 
 			if (bIncoming)
 			{
-				IncomingLanes.Add(FResolvedLane{ Entry.ApproachIndex, LaneIndex, LanePos, InwardDir, Lanes[LaneIndex].SpeedLimit });
+				IncomingLanes.Add(FResolvedLane{ Entry.ApproachIndex, LaneIndex, LanePos, InwardDir, Lanes[LaneIndex].SpeedLimit, Lanes[LaneIndex].Type });
 			}
 			if (bOutgoing)
 			{
-				OutgoingLanes.Add(FResolvedLane{ Entry.ApproachIndex, LaneIndex, LanePos, OutwardDir, Lanes[LaneIndex].SpeedLimit });
+				OutgoingLanes.Add(FResolvedLane{ Entry.ApproachIndex, LaneIndex, LanePos, OutwardDir, Lanes[LaneIndex].SpeedLimit, Lanes[LaneIndex].Type });
 			}
 		}
 	}
@@ -831,7 +857,8 @@ FFlexJunctionData FFlexIntersectionBuilder::BuildJunction(const FVector& NodePos
 	{
 		for (const FResolvedLane& Out : OutgoingLanes)
 		{
-			if (In.ApproachIndex == Out.ApproachIndex)
+			if (In.ApproachIndex == Out.ApproachIndex
+				|| (In.Type == EFlexLaneType::Rail) != (Out.Type == EFlexLaneType::Rail))
 			{
 				// No U-turn back onto the same approach; a real through-connection between two
 				// different approaches covers the ordinary 2-approach sharp-junction case.

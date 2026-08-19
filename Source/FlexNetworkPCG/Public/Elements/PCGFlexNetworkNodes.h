@@ -12,8 +12,8 @@ class FLEXNETWORKPCG_API UPCGFlexRoadMeshesSettings : public UPCGSettings
 public:
 #if WITH_EDITOR
 	virtual FName GetDefaultNodeName() const override { return TEXT("FlexRoadMeshes"); }
-	virtual FText GetDefaultNodeTitle() const override { return NSLOCTEXT("FlexNetworkPCG", "RoadTitle", "Flex Network: Road Meshes"); }
-	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "RoadTip", "Generates one PCG dynamic mesh per FlexNetwork road segment, with junction-aware endpoint trimming."); }
+	virtual FText GetDefaultNodeTitle() const override { return NSLOCTEXT("FlexNetworkPCG", "RoadTitle", "Flex Network: Road / Rail Meshes"); }
+	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "RoadTip", "Generates FlexNetwork road and railway dynamic meshes. World-scoped rail profiles are unified before grooved tram-rail boolean subtraction so switches remain continuous."); }
 	virtual EPCGSettingsType GetType() const override { return EPCGSettingsType::Spatial; }
 #endif
 	virtual TArray<FPCGPinProperties> InputPinProperties() const override { return {}; }
@@ -30,7 +30,7 @@ public:
 #if WITH_EDITOR
 	virtual FName GetDefaultNodeName() const override { return TEXT("FlexSidewalkMeshes"); }
 	virtual FText GetDefaultNodeTitle() const override { return NSLOCTEXT("FlexNetworkPCG", "SidewalkTitle", "Flex Network: Sidewalk Meshes"); }
-	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "SidewalkTip", "Generates the profile-driven sidewalk strips for every FlexNetwork segment."); }
+	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "SidewalkTip", "Generates profile-driven sidewalk strips on exposed FlexNetwork road segments; routing-only links inside grouped intersections are omitted."); }
 	virtual EPCGSettingsType GetType() const override { return EPCGSettingsType::Spatial; }
 #endif
 	virtual TArray<FPCGPinProperties> InputPinProperties() const override { return {}; }
@@ -47,7 +47,7 @@ public:
 #if WITH_EDITOR
 	virtual FName GetDefaultNodeName() const override { return TEXT("FlexIntersectionMeshes"); }
 	virtual FText GetDefaultNodeTitle() const override { return NSLOCTEXT("FlexNetworkPCG", "IntersectionTitle", "Flex Network: Intersection Meshes"); }
-	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "IntersectionTip", "Generates validated junction surfaces and separately composable crosswalk, sidewalk-corner, and island layers."); }
+	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "IntersectionTip", "Generates validated junction surfaces, including one filled surface for grouped multi-port OSM intersections, plus separately composable outer crosswalk layers."); }
 	virtual EPCGSettingsType GetType() const override { return EPCGSettingsType::Spatial; }
 #endif
 	virtual TArray<FPCGPinProperties> InputPinProperties() const override { return {}; }
@@ -64,7 +64,7 @@ public:
 #if WITH_EDITOR
 	virtual FName GetDefaultNodeName() const override { return TEXT("FlexCurbMeshes"); }
 	virtual FText GetDefaultNodeTitle() const override { return NSLOCTEXT("FlexNetworkPCG", "CurbTitle", "Flex Network: Curb Meshes"); }
-	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "CurbTip", "Extrudes chamfered curb prisms along trimmed road edges and genuine junction curb boundaries."); }
+	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "CurbTip", "Extrudes outward-facing chamfered curb prisms along exposed road/junction boundaries, leaving curb-cut gaps at crosswalks."); }
 	virtual EPCGSettingsType GetType() const override { return EPCGSettingsType::Spatial; }
 #endif
 	virtual TArray<FPCGPinProperties> InputPinProperties() const override { return {}; }

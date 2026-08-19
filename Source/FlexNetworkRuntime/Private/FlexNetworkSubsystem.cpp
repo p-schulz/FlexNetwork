@@ -2,14 +2,18 @@
 #include "FlexNetworkSettings.h"
 #include "FlexNetworkMeshActor.h"
 #include "FlexNetworkSegmentActor.h"
+#include "FlexNetworkBakeActor.h"
+#include "FlexNetworkBakeTypes.h"
 #include "PCGComponent.h"
 #include "Math/FlexBezierMath.h"
 #include "Math/FlexGeometry2D.h"
 #include "Mesh/FlexRoadMeshBuilder.h"
+#include "Mesh/FlexRailMeshBuilder.h"
 #include "Mesh/FlexUnifiedRoadMeshBuilder.h"
 #include "Intersection/FlexIntersectionBuilder.h"
 #include "Terrain/FlexLandscapeConformer.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 
 namespace
 {
@@ -45,23 +49,81 @@ namespace
 		}
 	}
 
-	TArray<FVector> BuildRoadFootprint(const TArray<FFlexCurveFrame>& Frames, float HalfWidth)
+	TArray<FVector> BuildRoadFootprint(const TArray<FFlexCurveFrame>& Frames, float MinOffset, float MaxOffset, float VerticalOffset = 0.f)
 	{
 		TArray<FVector> Boundary;
-		if (Frames.Num() < 2 || HalfWidth <= KINDA_SMALL_NUMBER)
+		if (Frames.Num() < 2 || MaxOffset - MinOffset <= KINDA_SMALL_NUMBER)
 		{
 			return Boundary;
 		}
 		Boundary.Reserve(Frames.Num() * 2);
 		for (const FFlexCurveFrame& Frame : Frames)
 		{
-			Boundary.Add(Frame.Position - Frame.Right * HalfWidth);
+			Boundary.Add(Frame.Position + Frame.Right * MinOffset + Frame.Up * VerticalOffset);
 		}
 		for (int32 Index = Frames.Num() - 1; Index >= 0; --Index)
 		{
-			Boundary.Add(Frames[Index].Position + Frames[Index].Right * HalfWidth);
+			Boundary.Add(Frames[Index].Position + Frames[Index].Right * MaxOffset + Frames[Index].Up * VerticalOffset);
 		}
 		return Boundary;
+	}
+
+	TArray<FVector> BuildConvexHullXY(TConstArrayView<FVector> SourcePoints)
+	{
+		TArray<FVector> Points;
+		Points.Reserve(SourcePoints.Num());
+		double ZSum = 0.0;
+		for (const FVector& Point : SourcePoints)
+		{
+			Points.Add(Point);
+			ZSum += Point.Z;
+		}
+		Points.Sort([](const FVector& A, const FVector& B)
+		{
+			return A.X < B.X || (FMath::IsNearlyEqual(A.X, B.X) && A.Y < B.Y);
+		});
+		for (int32 Index = Points.Num() - 1; Index > 0; --Index)
+		{
+			if (FVector2D(Points[Index].X, Points[Index].Y).Equals(
+				FVector2D(Points[Index - 1].X, Points[Index - 1].Y), 0.1))
+			{
+				Points.RemoveAt(Index);
+			}
+		}
+		if (Points.Num() < 3)
+		{
+			return {};
+		}
+
+		auto Cross = [](const FVector& Origin, const FVector& A, const FVector& B)
+		{
+			return (A.X - Origin.X) * (B.Y - Origin.Y) - (A.Y - Origin.Y) * (B.X - Origin.X);
+		};
+		TArray<FVector> Hull;
+		for (const FVector& Point : Points)
+		{
+			while (Hull.Num() >= 2 && Cross(Hull[Hull.Num() - 2], Hull.Last(), Point) <= UE_DOUBLE_SMALL_NUMBER)
+			{
+				Hull.Pop();
+			}
+			Hull.Add(Point);
+		}
+		const int32 LowerCount = Hull.Num();
+		for (int32 Index = Points.Num() - 2; Index >= 0; --Index)
+		{
+			while (Hull.Num() > LowerCount && Cross(Hull[Hull.Num() - 2], Hull.Last(), Points[Index]) <= UE_DOUBLE_SMALL_NUMBER)
+			{
+				Hull.Pop();
+			}
+			Hull.Add(Points[Index]);
+		}
+		Hull.Pop();
+		const double AverageZ = ZSum / static_cast<double>(SourcePoints.Num());
+		for (FVector& Point : Hull)
+		{
+			Point.Z = AverageZ;
+		}
+		return Hull;
 	}
 
 	void GetLaneRolesForNode(const FRoadLaneDescriptor& Lane, bool bNodeIsSegmentEnd, bool& bOutIncoming, bool& bOutOutgoing)
@@ -101,8 +163,9 @@ namespace
 			}
 			for (int32 FromLaneIndex = 0; FromLaneIndex < From.Profile->Lanes.Num(); ++FromLaneIndex)
 			{
+				const FRoadLaneDescriptor& FromLane = From.Profile->Lanes[FromLaneIndex];
 				bool bIncoming = false, bOutgoing = false;
-				GetLaneRolesForNode(From.Profile->Lanes[FromLaneIndex], From.bNodeIsSegmentEnd, bIncoming, bOutgoing);
+				GetLaneRolesForNode(FromLane, From.bNodeIsSegmentEnd, bIncoming, bOutgoing);
 				if (!bIncoming)
 				{
 					continue;
@@ -118,7 +181,7 @@ namespace
 					{
 						bool bToIncoming = false, bToOutgoing = false;
 						GetLaneRolesForNode(Lane, To.bNodeIsSegmentEnd, bToIncoming, bToOutgoing);
-						return bToOutgoing;
+						return bToOutgoing && Lane.IsRail() == FromLane.IsRail();
 					});
 					if (!bHasOutgoing)
 					{
@@ -133,7 +196,7 @@ namespace
 					});
 					if (!bConnected)
 					{
-						UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: junction %u:%u has no legal connector from road %u:%u lane %d to neighbouring road %u:%u."),
+						UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: junction %u:%u has no legal connector from segment %u:%u lane %d to neighbouring segment %u:%u."),
 							NodeId.Index, NodeId.Generation,
 							From.SegmentId.Index, From.SegmentId.Generation, FromLaneIndex,
 							To.SegmentId.Index, To.SegmentId.Generation);
@@ -152,6 +215,28 @@ void UFlexNetworkSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UFlexNetworkSubsystem::Deinitialize()
 {
+	ClearNetwork();
+	TerrainConformer.Reset();
+	Exporters.Reset();
+	Super::Deinitialize();
+}
+
+void UFlexNetworkSubsystem::OnWorldBeginPlay(UWorld& InWorld)
+{
+	Super::OnWorldBeginPlay(InWorld);
+	for (TActorIterator<AFlexNetworkBakeActor> It(&InWorld); It; ++It)
+	{
+		if (It->bRestoreAutomatically)
+		{
+			It->RestoreToSubsystem(*this);
+			break; // One authoritative baked graph per world.
+		}
+	}
+}
+
+void UFlexNetworkSubsystem::ClearNetwork()
+{
+	const bool bHadTrafficSignals = !TrafficSignals.IsEmpty();
 	for (TPair<FFlexSegmentId, TObjectPtr<AFlexNetworkSegmentActor>>& Pair : SegmentActors)
 	{
 		if (Pair.Value)
@@ -161,14 +246,37 @@ void UFlexNetworkSubsystem::Deinitialize()
 		}
 	}
 	SegmentActors.Reset();
+	RailPCGOwner = FFlexSegmentId::Invalid();
 	if (MeshActor)
 	{
 		MeshActor->Destroy();
 		MeshActor = nullptr;
 	}
-	TerrainConformer.Reset();
-	Exporters.Reset();
-	Super::Deinitialize();
+
+	if (TerrainConformer)
+	{
+		for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+		{
+			TerrainConformer->RemoveSegmentConforming(GetWorld(), Pair.Key);
+		}
+	}
+
+	Nodes.Reset();
+	Segments.Reset();
+	JunctionDataByNode.Reset();
+	TrafficSignals.Reset();
+	SpatialGrid.Clear();
+	NodeIdAllocator.Reset();
+	SegmentIdAllocator.Reset();
+	DirtyNodes.Reset();
+	DirtySegments.Reset();
+	BatchDepth = 0;
+	bTrafficSignalsChangedDuringBatch = false;
+	NextComplexIntersectionRegionIndex = 0;
+	if (bHadTrafficSignals)
+	{
+		BroadcastTrafficSignalsChanged();
+	}
 }
 
 AFlexNetworkSegmentActor* UFlexNetworkSubsystem::GetSegmentActor(FFlexSegmentId SegmentId) const
@@ -315,7 +423,7 @@ FFlexNodeId UFlexNetworkSubsystem::AddNode(const FVector& Position, EFlexRoadEle
 	return Id;
 }
 
-FFlexSegmentId UFlexNetworkSubsystem::AddSegment(FFlexNodeId StartNodeId, FFlexNodeId EndNodeId, const FVector& StartTangentHandle, const FVector& EndTangentHandle, URoadTypeProfile* Profile, EFlexRoadElevationType ElevationType)
+FFlexSegmentId UFlexNetworkSubsystem::AddSegment(FFlexNodeId StartNodeId, FFlexNodeId EndNodeId, const FVector& StartTangentHandle, const FVector& EndTangentHandle, URoadTypeProfile* Profile, EFlexRoadElevationType ElevationType, const FFlexElevationProfile& ElevationProfile)
 {
 	FFlexRoadNode* StartNode = Nodes.Find(StartNodeId);
 	FFlexRoadNode* EndNode = Nodes.Find(EndNodeId);
@@ -333,6 +441,7 @@ FFlexSegmentId UFlexNetworkSubsystem::AddSegment(FFlexNodeId StartNodeId, FFlexN
 	Segment.Curve.P3 = EndNode->Position;
 	Segment.Profile = Profile;
 	Segment.ElevationType = ElevationType;
+	Segment.ElevationProfile = ElevationProfile;
 	Segment.bDirty = true;
 	ApplyElevationEase(Segment);
 
@@ -350,6 +459,229 @@ FFlexSegmentId UFlexNetworkSubsystem::AddSegment(FFlexNodeId StartNodeId, FFlexN
 	return Id;
 }
 
+int32 UFlexNetworkSubsystem::LoadBakedNetwork(
+	const TArray<FFlexBakedNode>& BakedNodes,
+	const TArray<FFlexBakedSegment>& BakedSegments,
+	const TArray<FFlexBakedTrafficSignal>& BakedSignals,
+	EFlexNetworkVisualizationMode BakedVisualizationMode)
+{
+	ClearNetwork();
+	VisualizationMode = BakedVisualizationMode;
+
+	TMap<FFlexNodeId, FFlexNodeId> RestoredNodeIds;
+	RestoredNodeIds.Reserve(BakedNodes.Num());
+	BeginBatchUpdate();
+
+	for (const FFlexBakedNode& Record : BakedNodes)
+	{
+		const FFlexNodeId NewId = AddNode(Record.Position, Record.ElevationType, Record.UpVector);
+		if (FFlexRoadNode* Node = Nodes.Find(NewId))
+		{
+			Node->FilletRadiusOverride = Record.FilletRadiusOverride;
+			Node->ComplexIntersectionRegionIndex = Record.ComplexIntersectionRegionIndex;
+			if (Record.ComplexIntersectionRegionIndex != INDEX_NONE)
+			{
+				NextComplexIntersectionRegionIndex = FMath::Max(
+					NextComplexIntersectionRegionIndex, Record.ComplexIntersectionRegionIndex + 1);
+			}
+			RestoredNodeIds.Add(Record.SourceId, NewId);
+		}
+	}
+
+	int32 RestoredSegments = 0;
+	TMap<FFlexSegmentId, FFlexSegmentId> RestoredSegmentIds;
+	RestoredSegmentIds.Reserve(BakedSegments.Num());
+	for (const FFlexBakedSegment& Record : BakedSegments)
+	{
+		const FFlexNodeId* StartId = RestoredNodeIds.Find(Record.StartSourceNodeId);
+		const FFlexNodeId* EndId = RestoredNodeIds.Find(Record.EndSourceNodeId);
+		if (!StartId || !EndId || !Record.Profile)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("FlexNetwork bake: skipped segment %s because an endpoint or road profile is unavailable."), *Record.SourceId.ToString());
+			continue;
+		}
+		const FFlexSegmentId NewSegmentId = AddSegment(*StartId, *EndId, Record.StartTangentHandle, Record.EndTangentHandle,
+			Record.Profile, Record.ElevationType, Record.ElevationProfile);
+		if (NewSegmentId.IsValid())
+		{
+			RestoredSegmentIds.Add(Record.SourceId, NewSegmentId);
+			++RestoredSegments;
+		}
+	}
+
+	int32 RestoredSignals = 0;
+	for (const FFlexBakedTrafficSignal& Record : BakedSignals)
+	{
+		FFlexTrafficSignal Signal = Record.Signal;
+		const FFlexSegmentId* AnchorId = RestoredSegmentIds.Find(Signal.AnchorSegmentId);
+		const FFlexSegmentId* ApproachId = RestoredSegmentIds.Find(Signal.ControlledApproachSegmentId);
+		const FFlexNodeId* JunctionId = RestoredNodeIds.Find(Signal.ControlledJunctionNodeId);
+		if (!AnchorId || !ApproachId || !JunctionId)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("FlexNetwork bake: skipped traffic control %s because a graph attachment is unavailable."), *Signal.Id.ToString());
+			continue;
+		}
+		Signal.AnchorSegmentId = *AnchorId;
+		Signal.ControlledApproachSegmentId = *ApproachId;
+		Signal.ControlledJunctionNodeId = *JunctionId;
+		if (AddTrafficSignal(Signal).IsValid())
+		{
+			++RestoredSignals;
+		}
+	}
+
+	EndBatchUpdate();
+	UE_LOG(LogTemp, Display, TEXT("FlexNetwork: restored baked graph with %d node(s), %d segment(s), and %d traffic control(s) in world '%s'."),
+		RestoredNodeIds.Num(), RestoredSegments, RestoredSignals, GetWorld() ? *GetWorld()->GetName() : TEXT("<none>"));
+	return RestoredSegments;
+}
+
+int32 UFlexNetworkSubsystem::LoadBakedNetwork(
+	const TArray<FFlexBakedNode>& BakedNodes,
+	const TArray<FFlexBakedSegment>& BakedSegments,
+	EFlexNetworkVisualizationMode BakedVisualizationMode)
+{
+	return LoadBakedNetwork(BakedNodes, BakedSegments, TArray<FFlexBakedTrafficSignal>(), BakedVisualizationMode);
+}
+
+bool UFlexNetworkSubsystem::ValidateTrafficSignalAttachments(const FFlexTrafficSignal& Signal) const
+{
+	const FFlexRoadSegment* Anchor = Segments.Find(Signal.AnchorSegmentId);
+	const FFlexRoadSegment* Approach = Segments.Find(Signal.ControlledApproachSegmentId);
+	return Anchor && Approach && Nodes.Contains(Signal.ControlledJunctionNodeId)
+		&& (Approach->StartNodeId == Signal.ControlledJunctionNodeId
+			|| Approach->EndNodeId == Signal.ControlledJunctionNodeId);
+}
+
+void UFlexNetworkSubsystem::BroadcastTrafficSignalsChanged()
+{
+	if (BatchDepth > 0)
+	{
+		bTrafficSignalsChangedDuringBatch = true;
+		return;
+	}
+	OnTrafficSignalsChanged.Broadcast();
+	OnTrafficSignalsChangedBP.Broadcast();
+}
+
+FGuid UFlexNetworkSubsystem::AddTrafficSignal(const FFlexTrafficSignal& InSignal)
+{
+	if (!ValidateTrafficSignalAttachments(InSignal))
+	{
+		return FGuid();
+	}
+	FFlexTrafficSignal Signal = InSignal;
+	Signal.AnchorFraction = FMath::Clamp(Signal.AnchorFraction, 0.f, 1.f);
+	if (!Signal.Id.IsValid())
+	{
+		Signal.Id = FGuid::NewGuid();
+	}
+	const FGuid NewId = Signal.Id;
+	if (TrafficSignals.Contains(Signal.Id))
+	{
+		return FGuid();
+	}
+	TrafficSignals.Add(Signal.Id, MoveTemp(Signal));
+	BroadcastTrafficSignalsChanged();
+	return NewId;
+}
+
+bool UFlexNetworkSubsystem::UpdateTrafficSignal(const FFlexTrafficSignal& Signal)
+{
+	if (!Signal.Id.IsValid() || !TrafficSignals.Contains(Signal.Id)
+		|| !ValidateTrafficSignalAttachments(Signal))
+	{
+		return false;
+	}
+	FFlexTrafficSignal Updated = Signal;
+	Updated.AnchorFraction = FMath::Clamp(Updated.AnchorFraction, 0.f, 1.f);
+	TrafficSignals.FindChecked(Signal.Id) = MoveTemp(Updated);
+	BroadcastTrafficSignalsChanged();
+	return true;
+}
+
+bool UFlexNetworkSubsystem::RemoveTrafficSignal(const FGuid& SignalId)
+{
+	if (TrafficSignals.Remove(SignalId) == 0)
+	{
+		return false;
+	}
+	BroadcastTrafficSignalsChanged();
+	return true;
+}
+
+void UFlexNetworkSubsystem::ClearTrafficSignals()
+{
+	if (TrafficSignals.IsEmpty())
+	{
+		return;
+	}
+	TrafficSignals.Reset();
+	BroadcastTrafficSignalsChanged();
+}
+
+bool UFlexNetworkSubsystem::ResolveTrafficSignal(const FFlexTrafficSignal& Signal, FFlexResolvedTrafficSignal& OutResolved) const
+{
+	if (!Signal.bEnabled || !ValidateTrafficSignalAttachments(Signal))
+	{
+		return false;
+	}
+	const FFlexRoadSegment& Anchor = Segments.FindChecked(Signal.AnchorSegmentId);
+	const FFlexRoadSegment& Approach = Segments.FindChecked(Signal.ControlledApproachSegmentId);
+	const float AnchorArc = FMath::Clamp(Signal.AnchorFraction, 0.f, 1.f) * Anchor.GetLength();
+	const FFlexCurveFrame AnchorFrame = SampleSegmentAtArcLength(Signal.AnchorSegmentId, AnchorArc);
+	const bool bJunctionAtStart = Approach.StartNodeId == Signal.ControlledJunctionNodeId;
+	const float ApproachJunctionArc = bJunctionAtStart ? 0.f : Approach.GetLength();
+	const FFlexCurveFrame ApproachFrame = SampleSegmentAtArcLength(Signal.ControlledApproachSegmentId, ApproachJunctionArc);
+	const FVector Inbound = (bJunctionAtStart ? -ApproachFrame.Tangent : ApproachFrame.Tangent)
+		.GetSafeNormal(UE_SMALL_NUMBER, FVector::ForwardVector);
+	const FVector Up = AnchorFrame.Up.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+	const FVector InboundRight = FVector::CrossProduct(Up, Inbound)
+		.GetSafeNormal(UE_SMALL_NUMBER, AnchorFrame.Right);
+	const FVector Position = AnchorFrame.Position + InboundRight * Signal.LateralOffset + Up * Signal.HeightOffset;
+
+	float TrimStart = 0.f;
+	float TrimEnd = Approach.GetLength();
+	GetSegmentTrimRange(Signal.ControlledApproachSegmentId, TrimStart, TrimEnd);
+	const float SideArc = bJunctionAtStart ? TrimStart : TrimEnd;
+	FFlexCurveFrame SideFrame = SampleSegmentAtArcLength(Signal.ControlledApproachSegmentId, SideArc);
+	if (Approach.Profile)
+	{
+		SideFrame.Position += SideFrame.Right * Approach.Profile->GetRoadwayCenterOffset();
+	}
+
+	OutResolved.InboundDirection = Inbound;
+	OutResolved.ControlledIntersectionSideMidpoint = SideFrame.Position;
+	OutResolved.Transform = FTransform(FRotationMatrix::MakeFromXZ(Inbound, Up).ToQuat(), Position);
+	return true;
+}
+
+int32 UFlexNetworkSubsystem::RegisterComplexIntersectionRegion(TConstArrayView<FFlexNodeId> MemberNodeIds)
+{
+	TArray<FFlexNodeId> ValidMembers;
+	for (const FFlexNodeId NodeId : MemberNodeIds)
+	{
+		if (Nodes.Contains(NodeId))
+		{
+			ValidMembers.AddUnique(NodeId);
+		}
+	}
+	if (ValidMembers.Num() < 2)
+	{
+		return INDEX_NONE;
+	}
+
+	const int32 RegionIndex = NextComplexIntersectionRegionIndex++;
+	for (const FFlexNodeId NodeId : ValidMembers)
+	{
+		FFlexRoadNode& Node = Nodes.FindChecked(NodeId);
+		Node.ComplexIntersectionRegionIndex = RegionIndex;
+		DirtyNodes.Add(NodeId);
+	}
+	RebuildDirty();
+	return RegionIndex;
+}
+
 bool UFlexNetworkSubsystem::RemoveSegment(FFlexSegmentId SegmentId)
 {
 	FFlexRoadSegment* Segment = Segments.Find(SegmentId);
@@ -358,6 +690,19 @@ bool UFlexNetworkSubsystem::RemoveSegment(FFlexSegmentId SegmentId)
 		return false;
 	}
 
+	const bool bRemovedRail = Segment->Profile && Segment->Profile->bIsRailProfile;
+	TArray<FGuid> AttachedSignalIds;
+	for (const TPair<FGuid, FFlexTrafficSignal>& Pair : TrafficSignals)
+	{
+		if (Pair.Value.AnchorSegmentId == SegmentId || Pair.Value.ControlledApproachSegmentId == SegmentId)
+		{
+			AttachedSignalIds.Add(Pair.Key);
+		}
+	}
+	for (const FGuid& SignalId : AttachedSignalIds)
+	{
+		TrafficSignals.Remove(SignalId);
+	}
 	RemoveSegmentFromSpatialGrid(SegmentId, *Segment);
 	if (TerrainConformer)
 	{
@@ -385,10 +730,33 @@ bool UFlexNetworkSubsystem::RemoveSegment(FFlexSegmentId SegmentId)
 	Segments.Remove(SegmentId);
 	SegmentIdAllocator.Free(SegmentId);
 	DirtySegments.Remove(SegmentId);
+	if (bRemovedRail)
+	{
+		// Actor-driven PCG assigns the profile-wide rail boolean to the lowest live rail ID.
+		// If that owner was removed (even as an isolated segment), refresh its successor.
+		FFlexSegmentId NewRailOwner = FFlexSegmentId::Invalid();
+		for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+		{
+			if (Pair.Value.Profile && Pair.Value.Profile->bIsRailProfile
+				&& (!NewRailOwner.IsValid() || Pair.Key.Index < NewRailOwner.Index
+					|| (Pair.Key.Index == NewRailOwner.Index && Pair.Key.Generation < NewRailOwner.Generation)))
+			{
+				NewRailOwner = Pair.Key;
+			}
+		}
+		if (NewRailOwner.IsValid())
+		{
+			DirtySegments.Add(NewRailOwner);
+		}
+	}
 
 	DirtyNodes.Add(StartId);
 	DirtyNodes.Add(EndId);
 	RebuildDirty();
+	if (!AttachedSignalIds.IsEmpty())
+	{
+		BroadcastTrafficSignalsChanged();
+	}
 	return true;
 }
 
@@ -476,6 +844,52 @@ bool UFlexNetworkSubsystem::SetNodePosition(FFlexNodeId NodeId, const FVector& N
 	return true;
 }
 
+bool UFlexNetworkSubsystem::RotateNode(FFlexNodeId NodeId, const FQuat& DeltaRotation)
+{
+	FFlexRoadNode* Node = Nodes.Find(NodeId);
+	if (!Node || DeltaRotation.ContainsNaN())
+	{
+		return false;
+	}
+
+	const FQuat Rotation = DeltaRotation.GetNormalized();
+	if (Rotation.IsIdentity())
+	{
+		return true;
+	}
+
+	Node->UpVector = Rotation.RotateVector(Node->UpVector)
+		.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+
+	for (FFlexSegmentId SegId : Node->ConnectedSegments)
+	{
+		FFlexRoadSegment* Segment = Segments.Find(SegId);
+		if (!Segment)
+		{
+			continue;
+		}
+
+		RemoveSegmentFromSpatialGrid(SegId, *Segment);
+		if (Segment->StartNodeId == NodeId)
+		{
+			Segment->Curve.P1 = Segment->Curve.P0
+				+ Rotation.RotateVector(Segment->Curve.P1 - Segment->Curve.P0);
+		}
+		if (Segment->EndNodeId == NodeId)
+		{
+			Segment->Curve.P2 = Segment->Curve.P3
+				+ Rotation.RotateVector(Segment->Curve.P2 - Segment->Curve.P3);
+		}
+		ApplyElevationEase(*Segment);
+		AddSegmentToSpatialGrid(SegId, *Segment);
+		DirtySegments.Add(SegId);
+	}
+
+	DirtyNodes.Add(NodeId);
+	RebuildDirty();
+	return true;
+}
+
 bool UFlexNetworkSubsystem::SetNodeElevationType(FFlexNodeId NodeId, EFlexRoadElevationType NewType)
 {
 	FFlexRoadNode* Node = Nodes.Find(NodeId);
@@ -534,6 +948,7 @@ FFlexNodeId UFlexNetworkSubsystem::SplitSegment(FFlexSegmentId SegmentId, float 
 	}
 
 	const float ClampedArcLength = FMath::Clamp(ArcLength, 0.f, Segment->GetLength());
+	const float OriginalLength = Segment->GetLength();
 	const float T = FFlexBezierMath::ArcLengthToT(Segment->ArcLengthTable, ClampedArcLength);
 
 	FFlexBezierCurve Left, Right;
@@ -541,6 +956,12 @@ FFlexNodeId UFlexNetworkSubsystem::SplitSegment(FFlexSegmentId SegmentId, float 
 
 	const FFlexNodeId OldStartId = Segment->StartNodeId;
 	const FFlexNodeId OldEndId = Segment->EndNodeId;
+	const FFlexRoadNode* OldStartNode = Nodes.Find(OldStartId);
+	const FFlexRoadNode* OldEndNode = Nodes.Find(OldEndId);
+	const int32 InheritedComplexRegion = OldStartNode && OldEndNode
+		&& OldStartNode->ComplexIntersectionRegionIndex != INDEX_NONE
+		&& OldStartNode->ComplexIntersectionRegionIndex == OldEndNode->ComplexIntersectionRegionIndex
+		? OldStartNode->ComplexIntersectionRegionIndex : INDEX_NONE;
 	URoadTypeProfile* Profile = Segment->Profile;
 	const EFlexRoadElevationType ElevationType = Segment->ElevationType;
 	const FFlexElevationProfile ElevationProfile = Segment->ElevationProfile;
@@ -549,6 +970,10 @@ FFlexNodeId UFlexNetworkSubsystem::SplitSegment(FFlexSegmentId SegmentId, float 
 		Segment->Curve, Segment->ArcLengthTable, ClampedArcLength, ReferenceUp).Up;
 
 	const FFlexNodeId NewNodeId = AddNode(Left.P3, ElevationType, SplitUp);
+	if (FFlexRoadNode* NewNode = Nodes.Find(NewNodeId))
+	{
+		NewNode->ComplexIntersectionRegionIndex = InheritedComplexRegion;
+	}
 
 	DetachSegmentFromNode(OldEndId, SegmentId);
 	RemoveSegmentFromSpatialGrid(SegmentId, *Segment);
@@ -584,12 +1009,46 @@ FFlexNodeId UFlexNetworkSubsystem::SplitSegment(FFlexSegmentId SegmentId, float 
 		EndNode->ConnectedSegments.Add(NewSegmentId);
 	}
 
+	// Preserve authoritative signal attachments across the topology edit. Physical anchors after
+	// the cut move to the new right-hand segment; a control aimed at the old end junction must use
+	// that same new segment as its inbound approach.
+	bool bSignalAttachmentChanged = false;
+	for (TPair<FGuid, FFlexTrafficSignal>& Pair : TrafficSignals)
+	{
+		FFlexTrafficSignal& Signal = Pair.Value;
+		if (Signal.AnchorSegmentId == SegmentId)
+		{
+			const float OldAnchorArc = FMath::Clamp(Signal.AnchorFraction, 0.f, 1.f) * OriginalLength;
+			if (OldAnchorArc > ClampedArcLength && OriginalLength - ClampedArcLength > KINDA_SMALL_NUMBER)
+			{
+				Signal.AnchorSegmentId = NewSegmentId;
+				Signal.AnchorFraction = (OldAnchorArc - ClampedArcLength) / (OriginalLength - ClampedArcLength);
+			}
+			else
+			{
+				Signal.AnchorFraction = ClampedArcLength > KINDA_SMALL_NUMBER
+					? OldAnchorArc / ClampedArcLength : 0.f;
+			}
+			bSignalAttachmentChanged = true;
+		}
+		if (Signal.ControlledApproachSegmentId == SegmentId
+			&& Signal.ControlledJunctionNodeId == OldEndId)
+		{
+			Signal.ControlledApproachSegmentId = NewSegmentId;
+			bSignalAttachmentChanged = true;
+		}
+	}
+
 	DirtySegments.Add(SegmentId);
 	DirtySegments.Add(NewSegmentId);
 	DirtyNodes.Add(OldStartId);
 	DirtyNodes.Add(NewNodeId);
 	DirtyNodes.Add(OldEndId);
 	RebuildDirty();
+	if (bSignalAttachmentChanged)
+	{
+		BroadcastTrafficSignalsChanged();
+	}
 
 	return NewNodeId;
 }
@@ -876,6 +1335,122 @@ TArray<FFlexLaneConnector> UFlexNetworkSubsystem::GetLaneConnectorsAtNode(FFlexN
 	return {};
 }
 
+bool UFlexNetworkSubsystem::IsInternalComplexIntersectionSegment(const FFlexRoadSegment& Segment) const
+{
+	const FFlexRoadNode* StartNode = Nodes.Find(Segment.StartNodeId);
+	const FFlexRoadNode* EndNode = Nodes.Find(Segment.EndNodeId);
+	return StartNode && EndNode
+		&& StartNode->ComplexIntersectionRegionIndex != INDEX_NONE
+		&& StartNode->ComplexIntersectionRegionIndex == EndNode->ComplexIntersectionRegionIndex;
+}
+
+bool UFlexNetworkSubsystem::IsComplexIntersectionRegionOwner(FFlexNodeId NodeId) const
+{
+	const FFlexRoadNode* Node = Nodes.Find(NodeId);
+	if (!Node || Node->ComplexIntersectionRegionIndex == INDEX_NONE)
+	{
+		return false;
+	}
+	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Nodes)
+	{
+		if (Pair.Value.ComplexIntersectionRegionIndex == Node->ComplexIntersectionRegionIndex
+			&& JunctionDataByNode.Contains(Pair.Key)
+			&& (Pair.Key.Index < NodeId.Index
+				|| (Pair.Key.Index == NodeId.Index && Pair.Key.Generation < NodeId.Generation)))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+bool UFlexNetworkSubsystem::BuildComplexIntersectionRegionSurface(int32 RegionIndex,
+	FFlexUnifiedRoadPolygonInput& OutSurface) const
+{
+	OutSurface = FFlexUnifiedRoadPolygonInput();
+	if (RegionIndex == INDEX_NONE)
+	{
+		return false;
+	}
+
+	TSet<FFlexNodeId> MemberNodes;
+	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Nodes)
+	{
+		if (Pair.Value.ComplexIntersectionRegionIndex == RegionIndex)
+		{
+			MemberNodes.Add(Pair.Key);
+		}
+	}
+	if (MemberNodes.Num() < 2)
+	{
+		return false;
+	}
+
+	TArray<FVector> MouthCorners;
+	const FFlexRoadSegment* MaterialSegment = nullptr;
+	float WidestRoad = 0.f;
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || Segment.Profile->bIsRailProfile || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		const bool bStartInside = MemberNodes.Contains(Segment.StartNodeId);
+		const bool bEndInside = MemberNodes.Contains(Segment.EndNodeId);
+		if (!bStartInside && !bEndInside)
+		{
+			continue;
+		}
+
+		const float RoadWidth = Segment.Profile->GetRoadwayWidth();
+		if (!MaterialSegment || RoadWidth > WidestRoad)
+		{
+			MaterialSegment = &Segment;
+			WidestRoad = RoadWidth;
+		}
+		if (bStartInside == bEndInside)
+		{
+			continue; // Internal routing link: consumed by the region, not an outer mouth.
+		}
+
+		const FFlexRoadNode* StartNode = Nodes.Find(Segment.StartNodeId);
+		const FVector ReferenceUp = StartNode ? StartNode->UpVector : FVector::UpVector;
+		float MouthArcLength = bStartInside ? 0.f : Segment.GetLength();
+		const FFlexNodeId PortalNodeId = bStartInside ? Segment.StartNodeId : Segment.EndNodeId;
+		if (const FFlexJunctionData* PortalJunction = JunctionDataByNode.Find(PortalNodeId))
+		{
+			if (const float* TrimArcLength = PortalJunction->TrimArcLengthBySegment.Find(Pair.Key))
+			{
+				MouthArcLength = *TrimArcLength;
+			}
+		}
+		const FFlexCurveFrame Frame = FFlexRoadMeshBuilder::SampleFrameAtArcLength(
+			Segment.Curve, Segment.ArcLengthTable, MouthArcLength, ReferenceUp);
+		MouthCorners.Add(Frame.Position + Frame.Right * Segment.Profile->GetRoadwayMinOffset());
+		MouthCorners.Add(Frame.Position + Frame.Right * Segment.Profile->GetRoadwayMaxOffset());
+	}
+
+	if (!MaterialSegment || MouthCorners.Num() < 3)
+	{
+		return false;
+	}
+	OutSurface.Boundary = BuildConvexHullXY(MouthCorners);
+	if (OutSurface.Boundary.Num() < 3)
+	{
+		return false;
+	}
+
+	const URoadTypeProfile* Profile = MaterialSegment->Profile;
+	OutSurface.ElevationLayer = static_cast<int32>(MaterialSegment->ElevationType);
+	OutSurface.SidewalkWidth = Profile->SidewalkWidth;
+	OutSurface.CurbHeight = Profile->CurbHeight;
+	OutSurface.RoadMaterial = Profile->JunctionMaterial ? Profile->JunctionMaterial.Get() : Profile->RoadMaterial.Get();
+	OutSurface.SidewalkMaterial = Profile->SidewalkMaterial;
+	OutSurface.CurbMaterial = Profile->CurbMaterial ? Profile->CurbMaterial.Get() : Profile->SidewalkMaterial.Get();
+	return true;
+}
+
 bool UFlexNetworkSubsystem::BuildSegmentMeshResult(FFlexSegmentId SegmentId, FFlexSegmentMeshResult& OutResult) const
 {
 	const FFlexRoadSegment* Segment = Segments.Find(SegmentId);
@@ -883,9 +1458,22 @@ bool UFlexNetworkSubsystem::BuildSegmentMeshResult(FFlexSegmentId SegmentId, FFl
 	{
 		return false;
 	}
+	if (IsInternalComplexIntersectionSegment(*Segment))
+	{
+		// This edge remains in the lane graph, but its physical footprint is represented by the
+		// shared multi-port region. Emitting it separately recreates interior curbs/sidewalks.
+		OutResult = FFlexSegmentMeshResult();
+		return false;
+	}
 
 	float TrimStart = 0.f, TrimEnd = 0.f;
-	if (!GetSegmentTrimRange(SegmentId, TrimStart, TrimEnd))
+	if (Segment->Profile->bIsRailProfile)
+	{
+		// Rail junctions use overlapping continuous strips rather than a filled road polygon, so
+		// there is no junction surface for a trim to meet.
+		TrimEnd = Segment->GetLength();
+	}
+	else if (!GetSegmentTrimRange(SegmentId, TrimStart, TrimEnd))
 	{
 		return false;
 	}
@@ -930,6 +1518,16 @@ bool UFlexNetworkSubsystem::BuildJunctionMeshResult(FFlexNodeId NodeId, FFlexJun
 	{
 		return false;
 	}
+	bool bAllApproachesAreRail = !Node->ConnectedSegments.IsEmpty();
+	for (const FFlexSegmentId SegmentId : Node->ConnectedSegments)
+	{
+		const FFlexRoadSegment* Segment = Segments.Find(SegmentId);
+		bAllApproachesAreRail &= Segment && Segment->Profile && Segment->Profile->bIsRailProfile;
+	}
+	if (bAllApproachesAreRail)
+	{
+		return false;
+	}
 
 	UMaterialInterface* JunctionMaterial = nullptr;
 	UMaterialInterface* CrosswalkMaterial = nullptr;
@@ -939,15 +1537,90 @@ bool UFlexNetworkSubsystem::BuildJunctionMeshResult(FFlexNodeId NodeId, FFlexJun
 	{
 		if (const FFlexRoadSegment* Segment = Segments.Find(SegmentId); Segment && Segment->Profile)
 		{
+			if (Segment->Profile->bIsRailProfile)
+			{
+				continue;
+			}
 			JunctionMaterial = JunctionMaterial ? JunctionMaterial : Segment->Profile->JunctionMaterial.Get();
 			CrosswalkMaterial = CrosswalkMaterial ? CrosswalkMaterial : Segment->Profile->CrosswalkMaterial.Get();
 			SidewalkMaterial = SidewalkMaterial ? SidewalkMaterial : Segment->Profile->SidewalkMaterial.Get();
 			MedianMaterial = MedianMaterial ? MedianMaterial : Segment->Profile->MedianMaterial.Get();
 		}
 	}
-	OutResult = FFlexIntersectionBuilder::BuildJunctionMesh(Node->UpVector, *Junction,
+	FFlexJunctionData MeshJunction = *Junction;
+	if (Node->ComplexIntersectionRegionIndex != INDEX_NONE)
+	{
+		MeshJunction.Crosswalks.RemoveAll([this](const FFlexCrosswalkPlacement& Crosswalk)
+		{
+			const FFlexRoadSegment* Segment = Segments.Find(Crosswalk.SegmentId);
+			return Segment && IsInternalComplexIntersectionSegment(*Segment);
+		});
+	}
+	OutResult = FFlexIntersectionBuilder::BuildJunctionMesh(Node->UpVector, MeshJunction,
 		JunctionMaterial, CrosswalkMaterial ? CrosswalkMaterial : SidewalkMaterial, SidewalkMaterial, MedianMaterial);
-	return !OutResult.Surface.IsEmpty() || !OutResult.SidewalkCorners.IsEmpty();
+	if (Node->ComplexIntersectionRegionIndex != INDEX_NONE)
+	{
+		// The individual portal junctions still own their crosswalks and lane connectors, but
+		// their overlapping local surfaces/islands are replaced by one region-wide surface.
+		OutResult.Surface = FFlexMeshSectionData();
+		OutResult.SidewalkCorners = FFlexMeshSectionData();
+		OutResult.CornerIslands = FFlexMeshSectionData();
+		if (IsComplexIntersectionRegionOwner(NodeId))
+		{
+			FFlexUnifiedRoadPolygonInput RegionSurface;
+			if (BuildComplexIntersectionRegionSurface(Node->ComplexIntersectionRegionIndex, RegionSurface))
+			{
+				OutResult.Surface.Material = RegionSurface.RoadMaterial;
+				OutResult.Surface.bEnableCollision = true;
+				const FVector Up = Node->UpVector.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+				const FVector Tangent = FVector::VectorPlaneProject(FVector::ForwardVector, Up)
+					.GetSafeNormal(UE_SMALL_NUMBER, FVector::ForwardVector);
+				for (int32 Index = 1; Index + 1 < RegionSurface.Boundary.Num(); ++Index)
+				{
+					OutResult.Surface.AppendTriangle(RegionSurface.Boundary[0], RegionSurface.Boundary[Index],
+						RegionSurface.Boundary[Index + 1], Up, Tangent,
+						FVector2D(RegionSurface.Boundary[0].X, RegionSurface.Boundary[0].Y) * 0.01f,
+						FVector2D(RegionSurface.Boundary[Index].X, RegionSurface.Boundary[Index].Y) * 0.01f,
+						FVector2D(RegionSurface.Boundary[Index + 1].X, RegionSurface.Boundary[Index + 1].Y) * 0.01f);
+				}
+			}
+		}
+	}
+	return !OutResult.Surface.IsEmpty() || !OutResult.Crosswalks.IsEmpty()
+		|| !OutResult.SidewalkCorners.IsEmpty() || !OutResult.CornerIslands.IsEmpty();
+}
+
+void UFlexNetworkSubsystem::BuildRailMeshResults(TArray<FFlexMeshSectionData>& OutResults) const
+{
+	OutResults.Reset();
+	TMap<const URoadTypeProfile*, TArray<FFlexRailSweepInput>> SweepsByProfile;
+	const UFlexNetworkSettings* Settings = GetSettings();
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || !Segment.Profile->bIsRailProfile || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		const FFlexRoadNode* StartNode = Nodes.Find(Segment.StartNodeId);
+		FFlexRailSweepInput Sweep;
+		Sweep.Frames = FFlexRoadMeshBuilder::BuildFramesForRange(Segment.Curve, Segment.ArcLengthTable,
+			StartNode ? StartNode->UpVector : FVector::UpVector, Settings->ArcLengthSampleStep,
+			0.f, Segment.GetLength());
+		if (Sweep.Frames.Num() >= 2)
+		{
+			SweepsByProfile.FindOrAdd(Segment.Profile.Get()).Add(MoveTemp(Sweep));
+		}
+	}
+
+	for (const TPair<const URoadTypeProfile*, TArray<FFlexRailSweepInput>>& Pair : SweepsByProfile)
+	{
+		FFlexMeshSectionData Section;
+		if (FFlexRailMeshBuilder::BuildRailMesh(Pair.Value, Pair.Key, Section))
+		{
+			OutResults.Add(MoveTemp(Section));
+		}
+	}
 }
 
 FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResult() const
@@ -964,6 +1637,10 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 		const FFlexSegmentId SegmentId = Pair.Key;
 		const FFlexRoadSegment& Segment = Pair.Value;
 		if (!Segment.Profile || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		if (IsInternalComplexIntersectionSegment(Segment))
 		{
 			continue;
 		}
@@ -988,17 +1665,31 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 			}
 		}
 
+		const bool bRailProfile = Segment.Profile->bIsRailProfile;
 		const float AvailableRoadsideLength = FMath::Max(0.f, RawTrimEnd - RawTrimStart);
-		const float RequiredRoadsideLength = FMath::Max(Settings->CloseJunctionRoadsideClearance, Segment.Profile->SidewalkWidth * 2.f);
-		const bool bCloseJunctionBridge = StartJunction && EndJunction && AvailableRoadsideLength < RequiredRoadsideLength;
-		const float SurfaceStart = bCloseJunctionBridge ? 0.f : RawTrimStart;
-		const float SurfaceEnd = bCloseJunctionBridge ? SegmentLength : FMath::Max(RawTrimStart, RawTrimEnd);
+		// The offset-based sidewalk pass can safely build even a short exposed roadside. Suppress it
+		// only when the two junction trims actually meet/overlap, plus any explicit user-requested
+		// clearance. The previous implicit max(SidewalkWidth * 2, 600 cm) classified ordinary,
+		// visibly separate intersections as one consumed region and removed the full intermediate
+		// sidewalk strip.
+		const float CloseJunctionTolerance = FMath::Max(Settings->CloseJunctionRoadsideClearance, KINDA_SMALL_NUMBER);
+		const bool bCloseJunctionBridge = !bRailProfile && StartJunction && EndJunction
+			&& AvailableRoadsideLength <= CloseJunctionTolerance;
+		const float SurfaceStart = bRailProfile || bCloseJunctionBridge ? 0.f : RawTrimStart;
+		const float SurfaceEnd = bRailProfile || bCloseJunctionBridge ? SegmentLength : FMath::Max(RawTrimStart, RawTrimEnd);
 		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
 		const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(
 			Segment.Curve, Segment.ArcLengthTable, ReferenceUp, Settings->ArcLengthSampleStep, SurfaceStart, SurfaceEnd);
 
+		if (bRailProfile)
+		{
+			// Physical rails are built as closed solids in one profile-wide pass below. Keeping
+			// them out of the 2D road union also preserves raised rails at level crossings.
+			continue;
+		}
+
 		FFlexUnifiedRoadPolygonInput Surface;
-		Surface.Boundary = BuildRoadFootprint(Frames, Segment.Profile->GetRoadwayHalfWidth());
+		Surface.Boundary = BuildRoadFootprint(Frames, Segment.Profile->GetRoadwayMinOffset(), Segment.Profile->GetRoadwayMaxOffset());
 		Surface.ElevationLayer = static_cast<int32>(Segment.ElevationType);
 		Surface.SidewalkWidth = Segment.Profile->SidewalkWidth;
 		Surface.CurbHeight = Segment.Profile->CurbHeight;
@@ -1015,14 +1706,35 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 			// Keep the curb-line strictly inside the suppression polygon even for profiles whose
 			// sidewalk width is zero; containment on a coincident polygon edge is intentionally
 			// undefined in the boolean library.
-			const float SuppressionHalfWidth = Segment.Profile->GetRoadwayHalfWidth() + FMath::Max(Segment.Profile->SidewalkWidth, 50.f);
+			const float SuppressionExpansion = FMath::Max(Segment.Profile->SidewalkWidth, 50.f);
 			FFlexUnifiedRoadSuppressionInput Suppression;
-			Suppression.Boundary = BuildRoadFootprint(Frames, SuppressionHalfWidth);
+			Suppression.Boundary = BuildRoadFootprint(Frames,
+				Segment.Profile->GetRoadwayMinOffset() - SuppressionExpansion,
+				Segment.Profile->GetRoadwayMaxOffset() + SuppressionExpansion);
 			Suppression.ElevationLayer = static_cast<int32>(Segment.ElevationType);
 			if (Suppression.Boundary.Num() >= 3)
 			{
 				SuppressionInputs.Add(MoveTemp(Suppression));
 			}
+		}
+	}
+
+	// A compact OSM intersection keeps its original routing portals and headings. Fill the
+	// convex envelope of their physical road mouths once; the short internal routing links were
+	// deliberately omitted above, so they cannot create a central hole or interior sidewalks.
+	TSet<int32> AddedComplexRegions;
+	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Nodes)
+	{
+		const int32 RegionIndex = Pair.Value.ComplexIntersectionRegionIndex;
+		if (RegionIndex == INDEX_NONE || AddedComplexRegions.Contains(RegionIndex))
+		{
+			continue;
+		}
+		FFlexUnifiedRoadPolygonInput RegionSurface;
+		if (BuildComplexIntersectionRegionSurface(RegionIndex, RegionSurface))
+		{
+			SurfaceInputs.Add(MoveTemp(RegionSurface));
+			AddedComplexRegions.Add(RegionIndex);
 		}
 	}
 
@@ -1042,11 +1754,21 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 		{
 			if (const FFlexRoadSegment* Candidate = Segments.Find(SegmentId); Candidate && Candidate->Profile)
 			{
-				MaterialSegment = Candidate;
-				break;
+				if (!MaterialSegment || !Candidate->Profile->bIsRailProfile)
+				{
+					MaterialSegment = Candidate;
+				}
+				if (!Candidate->Profile->bIsRailProfile)
+				{
+					break;
+				}
 			}
 		}
 		if (!MaterialSegment || !MaterialSegment->Profile)
+		{
+			continue;
+		}
+		if (MaterialSegment->Profile->bIsRailProfile)
 		{
 			continue;
 		}
@@ -1064,9 +1786,57 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 			? MaterialSegment->Profile->CurbMaterial.Get()
 			: MaterialSegment->Profile->SidewalkMaterial.Get();
 		SurfaceInputs.Add(MoveTemp(Surface));
+
+		// A crosswalk is also a curb cut. Reserve a slightly expanded rectangle at each crossing so
+		// neither the procedural curb face nor the optional spline curbstones bridge across it. This
+		// suppression is curb-only: the sidewalk surface beyond the road edge remains continuous.
+		constexpr float CrosswalkCurbDepthPadding = 50.f;
+		// Half the maximum classic curb chord. This makes midpoint-based chord rejection
+		// conservative: a chord touching the crosswalk cannot survive by only a few centimeters.
+		constexpr float CrosswalkSidePadding = 50.f;
+		const FVector Up = Node->UpVector.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+		for (const FFlexCrosswalkPlacement& Crosswalk : Pair.Value.Crosswalks)
+		{
+			if (Node->ComplexIntersectionRegionIndex != INDEX_NONE)
+			{
+				const FFlexRoadSegment* CrossedSegment = Segments.Find(Crosswalk.SegmentId);
+				if (CrossedSegment && IsInternalComplexIntersectionSegment(*CrossedSegment))
+				{
+					continue;
+				}
+			}
+			if (Crosswalk.Width <= KINDA_SMALL_NUMBER || Crosswalk.Length <= KINDA_SMALL_NUMBER)
+			{
+				continue;
+			}
+			const FVector Along = FVector::VectorPlaneProject(Crosswalk.CrossingDirection, Up).GetSafeNormal();
+			const FVector Across = FVector::CrossProduct(Up, Along).GetSafeNormal();
+			if (Along.IsNearlyZero() || Across.IsNearlyZero())
+			{
+				continue;
+			}
+			const FVector HalfAlong = Along * (Crosswalk.Length * 0.5f + CrosswalkCurbDepthPadding);
+			const FVector HalfAcross = Across * (Crosswalk.Width * 0.5f + CrosswalkSidePadding);
+			FFlexUnifiedRoadSuppressionInput CrosswalkSuppression;
+			CrosswalkSuppression.Boundary = {
+				Crosswalk.Center - HalfAlong - HalfAcross,
+				Crosswalk.Center + HalfAlong - HalfAcross,
+				Crosswalk.Center + HalfAlong + HalfAcross,
+				Crosswalk.Center - HalfAlong + HalfAcross
+			};
+			CrosswalkSuppression.ElevationLayer = static_cast<int32>(MaterialSegment->ElevationType);
+			CrosswalkSuppression.bSuppressSidewalks = false;
+			CrosswalkSuppression.bSuppressCurbs = true;
+			SuppressionInputs.Add(MoveTemp(CrosswalkSuppression));
+		}
 	}
 
-	return FFlexUnifiedRoadMeshBuilder::Build(SurfaceInputs, SuppressionInputs);
+	FFlexUnifiedNetworkMeshResult Result = FFlexUnifiedRoadMeshBuilder::Build(
+		SurfaceInputs, SuppressionInputs, Settings->MinimumGeneratedPolygonArea);
+	TArray<FFlexMeshSectionData> RailSections;
+	BuildRailMeshResults(RailSections);
+	Result.Roadways.Append(MoveTemp(RailSections));
+	return Result;
 }
 
 FFlexCurveFrame UFlexNetworkSubsystem::SampleSegmentAtArcLength(FFlexSegmentId SegmentId, float ArcLength) const
@@ -1139,6 +1909,11 @@ void UFlexNetworkSubsystem::EndBatchUpdate()
 	if (--BatchDepth == 0)
 	{
 		RebuildDirty();
+		if (bTrafficSignalsChangedDuringBatch)
+		{
+			bTrafficSignalsChangedDuringBatch = false;
+			BroadcastTrafficSignalsChanged();
+		}
 	}
 }
 
@@ -1166,7 +1941,6 @@ void UFlexNetworkSubsystem::RebuildDirty()
 			AffectedNodes.Add(Segment->EndNodeId);
 		}
 	}
-
 	// 2. A junction rebuild at a shared node can change every connected segment's trim distance,
 	// not just the one that was directly edited -- so the final rebuild set is every segment
 	// touching an affected node, not just the explicitly dirty ones. This (rather than a full
@@ -1294,6 +2068,36 @@ void UFlexNetworkSubsystem::RebuildDirty()
 	TArray<FFlexSegmentId> SegmentIdsToRebuild = FinalDirtySegments.Array();
 	const bool bGenerateGeometry = VisualizationMode != EFlexNetworkVisualizationMode::SegmentActors;
 	const bool bGenerateSegmentActors = VisualizationMode != EFlexNetworkVisualizationMode::GeneratedGeometry;
+	if (bGenerateSegmentActors && SegmentIdsToRebuild.Num() > 0)
+	{
+		// Any graph edit can alter a crossing with the shared rail result. Refresh the single
+		// deterministic PCG owner as part of the same rebuild so it cannot retain stale booleans.
+		FFlexSegmentId RailOwner = FFlexSegmentId::Invalid();
+		for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+		{
+			if (Pair.Value.Profile && Pair.Value.Profile->bIsRailProfile
+				&& (!RailOwner.IsValid() || Pair.Key.Index < RailOwner.Index
+					|| (Pair.Key.Index == RailOwner.Index && Pair.Key.Generation < RailOwner.Generation)))
+			{
+				RailOwner = Pair.Key;
+			}
+		}
+		if (RailOwner.IsValid())
+		{
+			SegmentIdsToRebuild.AddUnique(RailOwner);
+		}
+		if (RailPCGOwner.IsValid() && RailPCGOwner != RailOwner && Segments.Contains(RailPCGOwner))
+		{
+			// Clear the output on the former owner when profile changes or ID reuse transfers
+			// ownership to another actor.
+			SegmentIdsToRebuild.AddUnique(RailPCGOwner);
+		}
+		RailPCGOwner = RailOwner;
+	}
+	else if (!bGenerateSegmentActors)
+	{
+		RailPCGOwner = FFlexSegmentId::Invalid();
+	}
 
 	AFlexNetworkMeshActor* Actor = bGenerateGeometry ? GetOrCreateMeshActor() : nullptr;
 	UWorld* World = GetWorld();
@@ -1328,7 +2132,15 @@ void UFlexNetworkSubsystem::RebuildDirty()
 			const TPair<float, float>* Range = TrimRangeBySegment.Find(SegId);
 			const float TrimStart = Range ? Range->Key : 0.f;
 			const float TrimEnd = Range ? Range->Value : Segment->GetLength();
-			const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(Segment->Curve, Segment->ArcLengthTable, RefUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
+			TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(Segment->Curve, Segment->ArcLengthTable, RefUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
+			const float RoadwayCenterOffset = Segment->Profile->GetRoadwayCenterOffset();
+			if (!FMath::IsNearlyZero(RoadwayCenterOffset))
+			{
+				for (FFlexCurveFrame& Frame : Frames)
+				{
+					Frame.Position += Frame.Right * RoadwayCenterOffset;
+				}
+			}
 			TerrainConformer->ConformSegment(World, SegId, Frames, Segment->Profile->GetRoadwayHalfWidth(), Settings->TerrainConformMargin, Settings->TerrainFalloffDistance);
 		}
 	}
@@ -1364,8 +2176,17 @@ void UFlexNetworkSubsystem::RebuildDirty()
 					}
 				}
 			}
+			FFlexJunctionData OverlayJunction = Pair.Value;
+			if (Node->ComplexIntersectionRegionIndex != INDEX_NONE)
+			{
+				OverlayJunction.Crosswalks.RemoveAll([this](const FFlexCrosswalkPlacement& Crosswalk)
+				{
+					const FFlexRoadSegment* Segment = Segments.Find(Crosswalk.SegmentId);
+					return Segment && IsInternalComplexIntersectionSegment(*Segment);
+				});
+			}
 			FFlexJunctionMeshResult JunctionMesh = FFlexIntersectionBuilder::BuildJunctionMesh(
-				Node->UpVector, Pair.Value, nullptr, CrosswalkMaterial, nullptr, nullptr);
+				Node->UpVector, OverlayJunction, nullptr, CrosswalkMaterial, nullptr, nullptr);
 			JunctionMesh.Surface = FFlexMeshSectionData();
 			JunctionMesh.SidewalkCorners = FFlexMeshSectionData();
 			JunctionMesh.CornerIslands = FFlexMeshSectionData();

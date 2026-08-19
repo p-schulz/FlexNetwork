@@ -17,11 +17,13 @@ struct FLEXNETWORKRUNTIME_API FFlexUnifiedRoadPolygonInput
 	UMaterialInterface* CurbMaterial = nullptr;
 };
 
-/** Region in which close junctions consume the available roadside space. */
+/** Region excluded from one or both roadside layers after the road polygons have been unified. */
 struct FLEXNETWORKRUNTIME_API FFlexUnifiedRoadSuppressionInput
 {
 	TArray<FVector> Boundary;
 	int32 ElevationLayer = 0;
+	bool bSuppressSidewalks = true;
+	bool bSuppressCurbs = true;
 };
 
 /**
@@ -33,5 +35,6 @@ class FLEXNETWORKRUNTIME_API FFlexUnifiedRoadMeshBuilder
 public:
 	static FFlexUnifiedNetworkMeshResult Build(
 		TConstArrayView<FFlexUnifiedRoadPolygonInput> SurfaceInputs,
-		TConstArrayView<FFlexUnifiedRoadSuppressionInput> SuppressionInputs);
+		TConstArrayView<FFlexUnifiedRoadSuppressionInput> SuppressionInputs,
+		double MinimumPolygonArea = 0.0);
 };

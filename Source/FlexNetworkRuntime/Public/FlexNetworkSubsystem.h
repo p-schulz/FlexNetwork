@@ -5,6 +5,8 @@
 #include "FlexNetworkTypes.h"
 #include "FlexRoadNode.h"
 #include "FlexRoadSegment.h"
+#include "FlexNetworkBakeTypes.h"
+#include "Traffic/FlexTrafficSignal.h"
 #include "Intersection/FlexLaneConnectorGraph.h"
 #include "Spatial/FlexSpatialGrid.h"
 #include "Terrain/IFlexTerrainConformer.h"
@@ -17,9 +19,13 @@ class UFlexNetworkSettings;
 struct FFlexSegmentMeshResult;
 struct FFlexJunctionMeshResult;
 struct FFlexUnifiedNetworkMeshResult;
+struct FFlexMeshSectionData;
+struct FFlexUnifiedRoadPolygonInput;
 
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnRoadNetworkChangedNative, const TArray<FFlexNodeId>& /*ChangedNodes*/, const TArray<FFlexSegmentId>& /*ChangedSegments*/);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRoadNetworkChangedDynamic, const TArray<FFlexNodeId>&, ChangedNodes, const TArray<FFlexSegmentId>&, ChangedSegments);
+DECLARE_MULTICAST_DELEGATE(FOnFlexTrafficSignalsChangedNative);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnFlexTrafficSignalsChangedDynamic);
 
 /** One point where a proposed new curve crosses an existing segment; drives the auto-split-on-crossing behavior from spec 1.7. */
 USTRUCT(BlueprintType)
@@ -60,6 +66,7 @@ class FLEXNETWORKRUNTIME_API UFlexNetworkSubsystem : public UWorldSubsystem
 public:
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
+	virtual void OnWorldBeginPlay(UWorld& InWorld) override;
 
 	// ---------------------------------------------------------------- Batch updates
 
@@ -80,7 +87,18 @@ public:
 	FFlexNodeId AddNode(const FVector& Position, EFlexRoadElevationType ElevationType = EFlexRoadElevationType::Ground, const FVector& UpVector = FVector::UpVector);
 
 	/** StartTangentHandle/EndTangentHandle are absolute world positions (FFlexBezierCurve::P1/P2), not offsets. */
-	FFlexSegmentId AddSegment(FFlexNodeId StartNodeId, FFlexNodeId EndNodeId, const FVector& StartTangentHandle, const FVector& EndTangentHandle, URoadTypeProfile* Profile, EFlexRoadElevationType ElevationType = EFlexRoadElevationType::Ground);
+	FFlexSegmentId AddSegment(FFlexNodeId StartNodeId, FFlexNodeId EndNodeId, const FVector& StartTangentHandle, const FVector& EndTangentHandle, URoadTypeProfile* Profile, EFlexRoadElevationType ElevationType = EFlexRoadElevationType::Ground, const FFlexElevationProfile& ElevationProfile = FFlexElevationProfile());
+
+	/** Removes the authoritative graph and every transient representation in this world. */
+	void ClearNetwork();
+
+	/** Reconstructs authored graph data stored by AFlexNetworkBakeActor and rebuilds all derivations. */
+	int32 LoadBakedNetwork(const TArray<FFlexBakedNode>& BakedNodes, const TArray<FFlexBakedSegment>& BakedSegments, const TArray<FFlexBakedTrafficSignal>& BakedSignals, EFlexNetworkVisualizationMode BakedVisualizationMode);
+	/** Compatibility overload for bake snapshots created before traffic signals were authoritative. */
+	int32 LoadBakedNetwork(const TArray<FFlexBakedNode>& BakedNodes, const TArray<FFlexBakedSegment>& BakedSegments, EFlexNetworkVisualizationMode BakedVisualizationMode);
+
+	/** Marks distinct retained nodes as routing portals of one shared complex-intersection surface. */
+	int32 RegisterComplexIntersectionRegion(TConstArrayView<FFlexNodeId> MemberNodeIds);
 
 	/** Removes Segment and detaches it from both endpoint nodes (the nodes themselves are kept, even if left with zero connections). */
 	bool RemoveSegment(FFlexSegmentId SegmentId);
@@ -89,9 +107,22 @@ public:
 	bool RemoveNode(FFlexNodeId NodeId);
 
 	bool SetNodePosition(FFlexNodeId NodeId, const FVector& NewPosition);
+	/** Rotates the node's local up vector and every connected Bezier endpoint tangent about the node position. */
+	bool RotateNode(FFlexNodeId NodeId, const FQuat& DeltaRotation);
 	bool SetNodeElevationType(FFlexNodeId NodeId, EFlexRoadElevationType NewType);
 	bool SetSegmentProfile(FFlexSegmentId SegmentId, URoadTypeProfile* NewProfile);
 	bool SetSegmentCurve(FFlexSegmentId SegmentId, const FVector& StartTangentHandle, const FVector& EndTangentHandle);
+
+	// ---------------------------------------------------------------- Traffic controls
+
+	/** Adds one directed control. Returns an invalid GUID if either graph attachment is invalid. */
+	FGuid AddTrafficSignal(const FFlexTrafficSignal& Signal);
+	bool UpdateTrafficSignal(const FFlexTrafficSignal& Signal);
+	bool RemoveTrafficSignal(const FGuid& SignalId);
+	void ClearTrafficSignals();
+	const TMap<FGuid, FFlexTrafficSignal>& GetAllTrafficSignals() const { return TrafficSignals; }
+	const FFlexTrafficSignal* GetTrafficSignal(const FGuid& SignalId) const { return TrafficSignals.Find(SignalId); }
+	bool ResolveTrafficSignal(const FFlexTrafficSignal& Signal, FFlexResolvedTrafficSignal& OutResolved) const;
 
 	/** Splits Segment at ArcLength (De Casteljau exact split), inserting a new node there. Returns the new node's id, or an invalid id if SegmentId/ArcLength are invalid. */
 	FFlexNodeId SplitSegment(FFlexSegmentId SegmentId, float ArcLength);
@@ -143,7 +174,13 @@ public:
 	/** Builds all visible layers of a cached junction using the same materials and geometry as the actor renderer. */
 	bool BuildJunctionMeshResult(FFlexNodeId NodeId, FFlexJunctionMeshResult& OutResult) const;
 
-	/** Position/tangent/right/up at ArcLength along Segment -- what the traffic sim samples to drive a vehicle along a lane (offset laterally by the lane's LateralOffset). */
+	/**
+	 * Builds rails grouped by profile across the complete graph. Outer solids and tram groove
+	 * cutters are unified before subtraction so switch/intersection geometry has no segment caps.
+	 */
+	void BuildRailMeshResults(TArray<FFlexMeshSectionData>& OutResults) const;
+
+	/** Position/tangent/right/up at ArcLength along Segment -- lane positions use Profile.LateralOffset + Lane.LateralOffset. */
 	FFlexCurveFrame SampleSegmentAtArcLength(FFlexSegmentId SegmentId, float ArcLength) const;
 
 	AFlexNetworkMeshActor* GetMeshActor() const { return MeshActor; }
@@ -172,6 +209,11 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "FlexNetwork")
 	FOnRoadNetworkChangedDynamic OnRoadNetworkChangedBP;
 
+	FOnFlexTrafficSignalsChangedNative OnTrafficSignalsChanged;
+
+	UPROPERTY(BlueprintAssignable, Category = "FlexNetwork|Traffic Signals")
+	FOnFlexTrafficSignalsChangedDynamic OnTrafficSignalsChangedBP;
+
 private:
 	TFlexIdAllocator<FFlexNodeId> NodeIdAllocator;
 	TFlexIdAllocator<FFlexSegmentId> SegmentIdAllocator;
@@ -188,6 +230,10 @@ private:
 	UPROPERTY()
 	TMap<FFlexNodeId, FFlexJunctionData> JunctionDataByNode;
 
+	/** Authoritative controls; MassTraffic assets and any future visual actors are projections. */
+	UPROPERTY()
+	TMap<FGuid, FFlexTrafficSignal> TrafficSignals;
+
 	FFlexSpatialGrid SpatialGrid;
 
 	TUniquePtr<IFlexTerrainConformer> TerrainConformer;
@@ -201,10 +247,14 @@ private:
 	TMap<FFlexSegmentId, TObjectPtr<AFlexNetworkSegmentActor>> SegmentActors;
 
 	EFlexNetworkVisualizationMode VisualizationMode = EFlexNetworkVisualizationMode::GeneratedGeometry;
+	/** Segment actor currently responsible for the single profile-wide PCG rail result. */
+	FFlexSegmentId RailPCGOwner = FFlexSegmentId::Invalid();
 
 	TSet<FFlexNodeId> DirtyNodes;
 	TSet<FFlexSegmentId> DirtySegments;
 	int32 BatchDepth = 0;
+	bool bTrafficSignalsChangedDuringBatch = false;
+	int32 NextComplexIntersectionRegionIndex = 0;
 
 	AFlexNetworkMeshActor* GetOrCreateMeshActor();
 	AFlexNetworkSegmentActor* GetOrCreateSegmentActor(FFlexSegmentId SegmentId);
@@ -216,6 +266,8 @@ private:
 	void RemoveSegmentFromSpatialGrid(FFlexSegmentId Id, const FFlexRoadSegment& Segment);
 
 	void DetachSegmentFromNode(FFlexNodeId NodeId, FFlexSegmentId SegmentId);
+	bool ValidateTrafficSignalAttachments(const FFlexTrafficSignal& Signal) const;
+	void BroadcastTrafficSignalsChanged();
 
 	/**
 	 * Recomputes arc-length tables, junction polygons/lane-connectors and terrain conforming for
@@ -225,6 +277,9 @@ private:
 	 */
 	void RebuildDirty();
 	FFlexUnifiedNetworkMeshResult BuildUnifiedClassicMeshResult() const;
+	bool IsInternalComplexIntersectionSegment(const FFlexRoadSegment& Segment) const;
+	bool BuildComplexIntersectionRegionSurface(int32 RegionIndex, FFlexUnifiedRoadPolygonInput& OutSurface) const;
+	bool IsComplexIntersectionRegionOwner(FFlexNodeId NodeId) const;
 
 	TArray<struct FFlexJunctionApproachInput> BuildApproachInputs(FFlexNodeId NodeId) const;
 };

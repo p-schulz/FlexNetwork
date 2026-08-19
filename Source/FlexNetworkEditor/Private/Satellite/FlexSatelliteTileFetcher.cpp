@@ -82,7 +82,9 @@ namespace FlexNetwork::Satellite
 		WebMercatorToLatLon(MaxX, MaxY, NeLat, NeLon);
 		const FVector2D LocalSw = FFlexOsmGraphBuilder::ProjectLatLonToLocalCm(SwLat, SwLon, OriginLat, OriginLon);
 		const FVector2D LocalNe = FFlexOsmGraphBuilder::ProjectLatLonToLocalCm(NeLat, NeLon, OriginLat, OriginLon);
-		const double WestCm = LocalSw.X, SouthCm = LocalSw.Y, EastCm = LocalNe.X, NorthCm = LocalNe.Y;
+		// Shared world convention is X=north, Y=east; keep the callback arguments geographic so
+		// AFlexSatelliteTileActor can map them onto the correct world axes explicitly.
+		const double SouthCm = LocalSw.X, WestCm = LocalSw.Y, NorthCm = LocalNe.X, EastCm = LocalNe.Y;
 
 		const FHttpRequestRef Request = FHttpModule::Get().CreateRequest();
 		Request->SetURL(Url);

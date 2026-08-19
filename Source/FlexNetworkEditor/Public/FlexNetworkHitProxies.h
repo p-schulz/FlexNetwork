@@ -4,7 +4,7 @@
 #include "HitProxies.h"
 #include "FlexNetworkTypes.h"
 
-/** Lets FFlexNetworkEdMode::HandleClick identify exactly which graph node a viewport click landed on, for selection + gizmo-drag movement. */
+/** Lets FFlexNetworkEdMode::HandleClick identify exactly which graph node a viewport click landed on for node editing. */
 struct HFlexNodeHitProxy : public HHitProxy
 {
 	DECLARE_HIT_PROXY()
@@ -28,6 +28,22 @@ struct HFlexSegmentHitProxy : public HHitProxy
 	explicit HFlexSegmentHitProxy(FFlexSegmentId InSegmentId)
 		: HHitProxy(HPP_UI)
 		, SegmentId(InSegmentId)
+	{
+	}
+};
+
+/** Selects one endpoint Bezier handle belonging to the currently selected node. */
+struct HFlexTangentHitProxy : public HHitProxy
+{
+	DECLARE_HIT_PROXY()
+
+	FFlexSegmentId SegmentId;
+	bool bStartHandle = false;
+
+	HFlexTangentHitProxy(FFlexSegmentId InSegmentId, bool bInStartHandle)
+		: HHitProxy(HPP_UI)
+		, SegmentId(InSegmentId)
+		, bStartHandle(bInStartHandle)
 	{
 	}
 };

@@ -19,7 +19,8 @@ public class FlexNetworkEditor : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"UnrealEd",
-			"FlexNetworkRuntime"
+			"FlexNetworkRuntime",
+			"FlexNetworkZoneGraph"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new[]
@@ -40,7 +41,9 @@ public class FlexNetworkEditor : ModuleRules
 			// Satellite/FlexSatelliteTileFetcher.cpp issues the LGL-BW WMS GetMap request and decodes
 			// its PNG response.
 			"HTTP",
-			"ImageWrapper"
+			"ImageWrapper",
+			"ZoneGraph",
+			"MassTraffic"
 		});
 	}
 }

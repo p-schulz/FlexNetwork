@@ -7,7 +7,9 @@
 #include "Osm/FlexOsmGraphBuilder.h"
 #include "FlexNetworkSubsystem.h"
 #include "RoadTypeProfile.h"
+#include "Mesh/FlexMeshSectionData.h"
 #include "Editor.h"
+#include "Misc/ScopeExit.h"
 
 namespace
 {
@@ -51,6 +53,7 @@ namespace
 		TEXT("<tag k=\"highway\" v=\"primary\"/>\n")
 		TEXT("<tag k=\"oneway\" v=\"yes\"/>\n")
 		TEXT("<tag k=\"lanes\" v=\"2\"/>\n")
+		TEXT("<tag k=\"placement\" v=\"middle_of:1\"/>\n")
 		TEXT("</way>\n")
 		TEXT("<way id=\"999\">\n") // Not in the default highway filter -- must be skipped entirely.
 		TEXT("<nd ref=\"20\"/>\n")
@@ -102,6 +105,53 @@ bool FFlexOsmParseTest::RunTest(const FString& Parameters)
 		AddError(TEXT("Relation 500 missing after parse"));
 	}
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFlexOsmSharedOriginTest, "FlexNetwork.Osm.SharedDeterministicOrigin", EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FFlexOsmSharedOriginTest::RunTest(const FString& Parameters)
+{
+	UOsmDataAsset* Asset = NewObject<UOsmDataAsset>(GetTransientPackage());
+
+	FOsmNode UnrelatedNode;
+	UnrelatedNode.Latitude = 1.0;
+	UnrelatedNode.Longitude = 2.0;
+	Asset->Nodes.Add(1, UnrelatedNode);
+	FOsmNode FirstRoadNode;
+	FirstRoadNode.Latitude = 49.0;
+	FirstRoadNode.Longitude = 8.0;
+	Asset->Nodes.Add(10, FirstRoadNode);
+	FOsmNode LaterRoadNode;
+	LaterRoadNode.Latitude = 49.1;
+	LaterRoadNode.Longitude = 8.1;
+	Asset->Nodes.Add(20, LaterRoadNode);
+
+	// Insert in the opposite order to the IDs: origin selection must not depend on TMap order.
+	FOsmWay LaterWay;
+	LaterWay.NodeRefs = { 20 };
+	LaterWay.Tags.Add(TEXT("highway"), TEXT("primary"));
+	Asset->Ways.Add(200, LaterWay);
+	FOsmWay FirstWay;
+	FirstWay.NodeRefs = { 10 };
+	FirstWay.Tags.Add(TEXT("highway"), TEXT("primary"));
+	Asset->Ways.Add(100, FirstWay);
+
+	FFlexOsmImportSettings Settings;
+	double OriginLat = 0.0;
+	double OriginLon = 0.0;
+	TestTrue(TEXT("Shared origin resolves"), FFlexOsmGraphBuilder::ResolveOrigin(*Asset, Settings, OriginLat, OriginLon));
+	TestEqual(TEXT("Lowest-ID matching way supplies latitude"), OriginLat, FirstRoadNode.Latitude);
+	TestEqual(TEXT("Lowest-ID matching way supplies longitude"), OriginLon, FirstRoadNode.Longitude);
+
+	FVector2D MinLocal;
+	FVector2D MaxLocal;
+	double ExtentOriginLat = 0.0;
+	double ExtentOriginLon = 0.0;
+	TestTrue(TEXT("Matching-road extent resolves"), FFlexOsmGraphBuilder::ComputeMatchingRoadExtent(
+		*Asset, Settings, ExtentOriginLat, ExtentOriginLon, MinLocal, MaxLocal));
+	TestEqual(TEXT("Extent and geometry use identical latitude origin"), ExtentOriginLat, OriginLat);
+	TestEqual(TEXT("Extent and geometry use identical longitude origin"), ExtentOriginLon, OriginLon);
 	return true;
 }
 
@@ -165,6 +215,24 @@ bool FFlexOsmGraphBuilderTest::RunTest(const FString& Parameters)
 	// Signature.ToKey() internally) but this synthetic dataset doesn't exercise that path.
 	TestEqual(TEXT("ResolveProfile called once per distinct signature"), NumResolveCalls, 3);
 
+	URoadTypeProfile* OneWayPlacementProfile = nullptr;
+	for (const TPair<FString, URoadTypeProfile*>& Pair : ProfileCache)
+	{
+		if (Pair.Value && Pair.Value->Lanes.Num() == 2
+			&& Pair.Value->Lanes[0].Direction == EFlexLaneDirection::Forward
+			&& Pair.Value->Lanes[1].Direction == EFlexLaneDirection::Forward)
+		{
+			OneWayPlacementProfile = Pair.Value;
+			break;
+		}
+	}
+	if (TestNotNull(TEXT("One-way placement profile was generated"), OneWayPlacementProfile))
+	{
+		TestEqual(TEXT("One-way roadway keeps its tagged 7m physical width"), OneWayPlacementProfile->GetRoadwayWidth(), 700.f);
+		TestEqual(TEXT("middle_of:1 places the first curb 1.75m left of the OSM line"), OneWayPlacementProfile->GetRoadwayMinOffset(), -175.f);
+		TestEqual(TEXT("middle_of:1 places the opposite curb 5.25m right of the OSM line"), OneWayPlacementProfile->GetRoadwayMaxOffset(), 525.f);
+	}
+
 	// Node 20 is shared by all three imported ways (way 102 passes through it, contributing two
 	// segments on its own, plus one each from ways 100 and 101) -- confirm a real multi-way
 	// junction (3+ segment connections) exists where they meet.
@@ -179,6 +247,255 @@ bool FFlexOsmGraphBuilderTest::RunTest(const FString& Parameters)
 	}
 	TestTrue(TEXT("A multi-way junction exists where the three imported ways meet"), bFoundMultiWayJunction);
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFlexOsmComplexIntersectionCollapseTest,
+	"FlexNetwork.Osm.CollapsesComplexIntersectionInterior",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FFlexOsmComplexIntersectionCollapseTest::RunTest(const FString& Parameters)
+{
+	if (!GEditor)
+	{
+		AddError(TEXT("Test requires a running editor context (GEditor)."));
+		return false;
+	}
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	UFlexNetworkSubsystem* Subsystem = World ? World->GetSubsystem<UFlexNetworkSubsystem>() : nullptr;
+	if (!TestNotNull(TEXT("Subsystem available"), Subsystem))
+	{
+		return false;
+	}
+	Subsystem->ClearNetwork();
+	ON_SCOPE_EXIT { Subsystem->ClearNetwork(); };
+
+	UOsmDataAsset* Asset = NewObject<UOsmDataAsset>(GetTransientPackage());
+	auto AddNode = [Asset](int64 Id, double Lat, double Lon)
+	{
+		FOsmNode Node;
+		Node.Latitude = Lat;
+		Node.Longitude = Lon;
+		Asset->Nodes.Add(Id, Node);
+	};
+	auto AddRoad = [Asset](int64 Id, int64 A, int64 B)
+	{
+		FOsmWay Way;
+		Way.NodeRefs = { A, B };
+		Way.Tags.Add(TEXT("highway"), TEXT("residential"));
+		Way.Tags.Add(TEXT("lanes"), TEXT("2"));
+		Asset->Ways.Add(Id, MoveTemp(Way));
+	};
+
+	// Four nearby degree-4 junctions surrounding one mapped intersection interior, with two
+	// external approaches at each corner. This is the same topological pattern as Block_Gerwig.
+	AddNode(1, 49.00000, 8.00000); AddNode(2, 49.00000, 8.00015);
+	AddNode(3, 49.00010, 8.00015); AddNode(4, 49.00010, 8.00000);
+	AddNode(51, 49.00000, 8.000075); AddNode(52, 49.00005, 8.00015);
+	AddNode(53, 49.00010, 8.000075); AddNode(54, 49.00005, 8.00000);
+	AddNode(11, 49.00000, 7.99975); AddNode(12, 48.99980, 8.00000);
+	AddNode(21, 49.00000, 8.00040); AddNode(22, 48.99980, 8.00015);
+	AddNode(31, 49.00010, 8.00040); AddNode(32, 49.00030, 8.00015);
+	AddNode(41, 49.00010, 7.99975); AddNode(42, 49.00030, 8.00000);
+	AddRoad(100, 1, 51); AddRoad(104, 51, 2);
+	AddRoad(101, 2, 52); AddRoad(105, 52, 3);
+	AddRoad(102, 3, 53); AddRoad(106, 53, 4);
+	AddRoad(103, 4, 54); AddRoad(107, 54, 1);
+	AddRoad(110, 1, 11); AddRoad(111, 1, 12); AddRoad(120, 2, 21); AddRoad(121, 2, 22);
+	AddRoad(130, 3, 31); AddRoad(131, 3, 32); AddRoad(140, 4, 41); AddRoad(141, 4, 42);
+
+	FFlexOsmImportSettings Settings;
+	Settings.JunctionMergeRadius = 0.f;
+	Settings.ComplexIntersectionInternalEdgeLength = 2000.f;
+	Settings.ComplexIntersectionMaxDiameter = 5000.f;
+	TMap<FString, URoadTypeProfile*> Profiles;
+	const FFlexOsmGraphBuilder::FImportResult Result = FFlexOsmGraphBuilder::BuildFromOsm(*Subsystem, *Asset, Settings,
+		[&Profiles](const FFlexOsmGraphBuilder::FLaneSignature& Signature)
+		{
+			URoadTypeProfile*& Profile = Profiles.FindOrAdd(Signature.ToKey());
+			if (!Profile)
+			{
+				Profile = NewObject<URoadTypeProfile>(GetTransientPackage());
+				FFlexOsmGraphBuilder::ConfigureProfileFromLaneSignature(*Profile, Signature);
+			}
+			return Profile;
+		});
+
+	TestEqual(TEXT("The short four-junction interior is detected as one region"), Result.NumComplexIntersectionsCollapsed, 1);
+	TArray<FFlexNodeId> RegionNodes;
+	int32 RegionIndex = INDEX_NONE;
+	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Subsystem->GetAllNodes())
+	{
+		if (Pair.Value.ComplexIntersectionRegionIndex != INDEX_NONE)
+		{
+			RegionNodes.Add(Pair.Key);
+			RegionIndex = Pair.Value.ComplexIntersectionRegionIndex;
+			TestEqual(TEXT("Each retained portal remains a four-way routing node"), Pair.Value.ConnectedSegments.Num(), 4);
+		}
+	}
+	TestEqual(TEXT("All four original junction portals are retained"), RegionNodes.Num(), 4);
+	bool bAllPortalsShareRegion = RegionIndex != INDEX_NONE;
+	for (const FFlexNodeId NodeId : RegionNodes)
+	{
+		const FFlexRoadNode* Node = Subsystem->GetNode(NodeId);
+		bAllPortalsShareRegion &= Node && Node->ComplexIntersectionRegionIndex == RegionIndex;
+	}
+	TestTrue(TEXT("The retained portals share a complex-region index"), bAllPortalsShareRegion);
+	TestEqual(TEXT("Interior degree-2 shape nodes are removed, leaving eight external and four portal nodes"),
+		Subsystem->GetAllNodes().Num(), 12);
+	TestEqual(TEXT("Eight approaches and four routing-only internal links remain"), Subsystem->GetAllSegments().Num(), 12);
+	TestEqual(TEXT("Import counters preserve the navigable OSM graph"), Result.NumSegmentsCreated, 12);
+
+	int32 NumInternalRoutingLinks = 0;
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Subsystem->GetAllSegments())
+	{
+		const FFlexRoadNode* Start = Subsystem->GetNode(Pair.Value.StartNodeId);
+		const FFlexRoadNode* End = Subsystem->GetNode(Pair.Value.EndNodeId);
+		if (Start && End && Start->ComplexIntersectionRegionIndex == RegionIndex
+			&& End->ComplexIntersectionRegionIndex == RegionIndex)
+		{
+			++NumInternalRoutingLinks;
+			FFlexSegmentMeshResult InternalMesh;
+			TestFalse(TEXT("An internal routing link emits no independent road/sidewalk mesh"),
+				Subsystem->BuildSegmentMeshResult(Pair.Key, InternalMesh));
+		}
+	}
+	TestEqual(TEXT("The four internal links remain routing-only"), NumInternalRoutingLinks, 4);
+
+	int32 NumRegionSurfaces = 0;
+	bool bFoundTurningConnector = false;
+	for (const FFlexNodeId RegionNodeId : RegionNodes)
+	{
+		const FFlexJunctionData* Junction = Subsystem->GetJunctionData(RegionNodeId);
+		if (TestNotNull(TEXT("The retained portal builds junction data"), Junction))
+		{
+			TestTrue(TEXT("Each portal generates local lane connectors"), Junction->LaneConnectors.Num() > 0);
+			bFoundTurningConnector |= Junction->LaneConnectors.ContainsByPredicate([](const FFlexLaneConnector& Connector)
+			{
+				return Connector.TurnAngleDegrees > 30.f;
+			});
+		}
+		FFlexJunctionMeshResult Mesh;
+		if (Subsystem->BuildJunctionMeshResult(RegionNodeId, Mesh) && !Mesh.Surface.IsEmpty())
+		{
+			++NumRegionSurfaces;
+		}
+	}
+	TestTrue(TEXT("The retained routing graph includes vehicle turns"), bFoundTurningConnector);
+	TestEqual(TEXT("Exactly one portal owner emits the shared filled region surface"), NumRegionSurfaces, 1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFlexOsmRailwayImportTest,
+	"FlexNetwork.Osm.ImportsTrainAndTramRails",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FFlexOsmRailwayImportTest::RunTest(const FString& Parameters)
+{
+	if (!GEditor)
+	{
+		AddError(TEXT("Test requires a running editor context (GEditor)."));
+		return false;
+	}
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	UFlexNetworkSubsystem* Subsystem = World ? World->GetSubsystem<UFlexNetworkSubsystem>() : nullptr;
+	if (!TestNotNull(TEXT("Subsystem available"), Subsystem))
+	{
+		return false;
+	}
+	Subsystem->ClearNetwork();
+	ON_SCOPE_EXIT { Subsystem->ClearNetwork(); };
+
+	UOsmDataAsset* Asset = NewObject<UOsmDataAsset>(GetTransientPackage());
+	auto AddNode = [Asset](int64 Id, double Lat, double Lon)
+	{
+		FOsmNode Node;
+		Node.Latitude = Lat;
+		Node.Longitude = Lon;
+		Asset->Nodes.Add(Id, Node);
+	};
+	AddNode(1, 49.00000, 8.00000); AddNode(2, 49.00010, 8.00000);
+	AddNode(3, 49.00000, 8.00001); AddNode(4, 49.00010, 8.00001);
+
+	FOsmWay TrainWay;
+	TrainWay.NodeRefs = { 1, 2 };
+	TrainWay.Tags.Add(TEXT("railway"), TEXT("rail"));
+	TrainWay.Tags.Add(TEXT("tracks"), TEXT("2"));
+	TrainWay.Tags.Add(TEXT("gauge"), TEXT("1435"));
+	Asset->Ways.Add(200, MoveTemp(TrainWay));
+
+	FOsmWay TramWay;
+	TramWay.NodeRefs = { 3, 4 };
+	TramWay.Tags.Add(TEXT("railway"), TEXT("tram"));
+	TramWay.Tags.Add(TEXT("gauge"), TEXT("1000"));
+	Asset->Ways.Add(201, MoveTemp(TramWay));
+
+	FFlexOsmImportSettings Settings;
+	Settings.JunctionMergeRadius = 500.f; // The parallel ways are <1m apart and must remain distinct.
+	TMap<FString, URoadTypeProfile*> Profiles;
+	const FFlexOsmGraphBuilder::FImportResult Result = FFlexOsmGraphBuilder::BuildFromOsm(*Subsystem, *Asset, Settings,
+		[&Profiles](const FFlexOsmGraphBuilder::FLaneSignature& Signature)
+		{
+			URoadTypeProfile*& Profile = Profiles.FindOrAdd(Signature.ToKey());
+			if (!Profile)
+			{
+				Profile = NewObject<URoadTypeProfile>(GetTransientPackage());
+				FFlexOsmGraphBuilder::ConfigureProfileFromLaneSignature(*Profile, Signature);
+			}
+			return Profile;
+		});
+
+	TestEqual(TEXT("Both railway ways are imported"), Result.NumRailwayWaysImported, 2);
+	TestEqual(TEXT("One segment is generated per two-node railway way"), Subsystem->GetAllSegments().Num(), 2);
+	TestEqual(TEXT("Nearby parallel railway nodes are not proximity-merged"), Subsystem->GetAllNodes().Num(), 4);
+	TestEqual(TEXT("No road proximity junction is reported for parallel tracks"), Result.NumJunctionsMerged, 0);
+	TestEqual(TEXT("Train and tram configurations produce distinct profiles"), Profiles.Num(), 2);
+
+	bool bFoundStandardGaugeTwoTrack = false;
+	bool bFoundMeterGaugeTram = false;
+	for (const TPair<FString, URoadTypeProfile*>& Pair : Profiles)
+	{
+		const URoadTypeProfile* Profile = Pair.Value;
+		if (!TestNotNull(TEXT("Generated railway profile"), Profile))
+		{
+			continue;
+		}
+		TestTrue(TEXT("Generated railway profile is marked as rail"), Profile->bIsRailProfile);
+		TestEqual(TEXT("Railway profile has no sidewalks"), Profile->SidewalkWidth, 0.f);
+		TestEqual(TEXT("Railway profile has no curb"), Profile->CurbHeight, 0.f);
+		const bool bIsStandardGaugeTrain = FMath::IsNearlyEqual(Profile->RailGauge, 143.5f) && Profile->Lanes.Num() == 2;
+		const bool bIsMeterGaugeTram = FMath::IsNearlyEqual(Profile->RailGauge, 100.f) && Profile->Lanes.Num() == 1;
+		bFoundStandardGaugeTwoTrack |= bIsStandardGaugeTrain;
+		bFoundMeterGaugeTram |= bIsMeterGaugeTram;
+		if (bIsStandardGaugeTrain)
+		{
+			TestFalse(TEXT("Ordinary railway keeps the ungrooved solid profile"), Profile->bUseGroovedRailProfile);
+		}
+		if (bIsMeterGaugeTram)
+		{
+			TestTrue(TEXT("railway=tram enables the boolean groove profile"), Profile->bUseGroovedRailProfile);
+			TestEqual(TEXT("Default tram rail base follows the 156 mm reference"), Profile->RailWidth, 15.6f);
+			TestEqual(TEXT("Default tram rail crown follows the 115 mm reference"), Profile->RailTopWidth, 11.5f);
+			TestEqual(TEXT("Default tram rail height follows the 72 mm reference"), Profile->RailHeight, 7.2f);
+		}
+		for (const FRoadLaneDescriptor& Lane : Profile->Lanes)
+		{
+			TestTrue(TEXT("Every railway profile lane has Rail type"), Lane.Type == EFlexLaneType::Rail);
+		}
+	}
+	TestTrue(TEXT("OSM tracks=2 and gauge=1435 are applied"), bFoundStandardGaugeTwoTrack);
+	TestTrue(TEXT("OSM tram gauge=1000 is converted from mm to cm"), bFoundMeterGaugeTram);
+
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Subsystem->GetAllSegments())
+	{
+		FFlexSegmentMeshResult Mesh;
+		TestTrue(TEXT("Rail segment produces a mesh"), Subsystem->BuildSegmentMeshResult(Pair.Key, Mesh));
+		TestFalse(TEXT("Rail segment mesh is not a roadway slab"), Mesh.Roadway.IsEmpty());
+		TestTrue(TEXT("Rail segment mesh has no sidewalk section"), Mesh.Sidewalks.IsEmpty());
+	}
+	TArray<FFlexMeshSectionData> UnifiedRailMeshes;
+	Subsystem->BuildRailMeshResults(UnifiedRailMeshes);
+	TestEqual(TEXT("The two different rail profiles produce two unified mesh sections"), UnifiedRailMeshes.Num(), 2);
 	return true;
 }
 
@@ -251,8 +568,9 @@ bool FFlexOsmRealFileSmokeTest::RunTest(const FString& Parameters)
 		AddWarning(Warning);
 	}
 
-	AddInfo(FString::Printf(TEXT("Import result: %d way(s), %d node(s), %d segment(s), %d junction(s) merged, %d distinct lane signature(s)."),
-		Result.NumWaysImported, Result.NumNodesCreated, Result.NumSegmentsCreated, Result.NumJunctionsMerged, Result.NumDistinctLaneSignatures));
+	AddInfo(FString::Printf(TEXT("Import result: %d way(s), including %d railway way(s), %d node(s), %d segment(s), %d proximity junction(s) merged, %d complex intersection surface region(s), %d distinct lane signature(s)."),
+		Result.NumWaysImported, Result.NumRailwayWaysImported, Result.NumNodesCreated, Result.NumSegmentsCreated, Result.NumJunctionsMerged,
+		Result.NumComplexIntersectionsCollapsed, Result.NumDistinctLaneSignatures));
 
 	if (Result.NumWaysImported > 0)
 	{

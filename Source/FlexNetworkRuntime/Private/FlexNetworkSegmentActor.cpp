@@ -35,8 +35,9 @@ void AFlexNetworkSegmentActor::UpdateFromSegment(FFlexSegmentId InId, const FFle
 {
 	SegmentId = InId;
 	Tags.AddUnique(TEXT("FlexNetworkSegment"));
-	const float RoadExtent = Segment.Profile ? Segment.Profile->GetRoadwayHalfWidth() : 0.f;
-	const float SidewalkExtent = Segment.Profile ? RoadExtent + Segment.Profile->SidewalkWidth : RoadExtent;
+	const float RoadMinOffset = Segment.Profile ? Segment.Profile->GetRoadwayMinOffset() : 0.f;
+	const float RoadMaxOffset = Segment.Profile ? Segment.Profile->GetRoadwayMaxOffset() : 0.f;
+	const float SidewalkWidth = Segment.Profile ? Segment.Profile->SidewalkWidth : 0.f;
 	const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(
 		Segment.Curve, Segment.ArcLengthTable, ReferenceUp, SampleStep, TrimStartArcLength, TrimEndArcLength);
 
@@ -46,10 +47,10 @@ void AFlexNetworkSegmentActor::UpdateFromSegment(FFlexSegmentId InId, const FFle
 	for (const FFlexCurveFrame& Frame : Frames)
 	{
 		Center.Add(Frame.Position);
-		RoadLeft.Add(Frame.Position - Frame.Right * RoadExtent);
-		RoadRight.Add(Frame.Position + Frame.Right * RoadExtent);
-		WalkLeft.Add(Frame.Position - Frame.Right * SidewalkExtent);
-		WalkRight.Add(Frame.Position + Frame.Right * SidewalkExtent);
+		RoadLeft.Add(Frame.Position + Frame.Right * RoadMinOffset);
+		RoadRight.Add(Frame.Position + Frame.Right * RoadMaxOffset);
+		WalkLeft.Add(Frame.Position + Frame.Right * (RoadMinOffset - SidewalkWidth));
+		WalkRight.Add(Frame.Position + Frame.Right * (RoadMaxOffset + SidewalkWidth));
 	}
 
 	auto SetPoints = [](USplineComponent* Spline, const TArray<FVector>& Points, bool bVisible)
@@ -60,8 +61,9 @@ void AFlexNetworkSegmentActor::UpdateFromSegment(FFlexSegmentId InId, const FFle
 		Spline->SetHiddenInGame(!bVisible);
 	};
 	SetPoints(Centerline, Center, true);
-	SetPoints(RoadLeftEdge, RoadLeft, RoadExtent > KINDA_SMALL_NUMBER);
-	SetPoints(RoadRightEdge, RoadRight, RoadExtent > KINDA_SMALL_NUMBER);
+	const bool bHasRoadway = RoadMaxOffset - RoadMinOffset > KINDA_SMALL_NUMBER;
+	SetPoints(RoadLeftEdge, RoadLeft, bHasRoadway);
+	SetPoints(RoadRightEdge, RoadRight, bHasRoadway);
 	const bool bHasSidewalk = Segment.Profile && Segment.Profile->SidewalkWidth > KINDA_SMALL_NUMBER;
 	SetPoints(SidewalkLeftEdge, WalkLeft, bHasSidewalk);
 	SetPoints(SidewalkRightEdge, WalkRight, bHasSidewalk);

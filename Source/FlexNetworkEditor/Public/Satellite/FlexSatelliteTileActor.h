@@ -11,7 +11,7 @@ struct FFlexLGLImageryLayerPreset;
 
 /**
  * A single flat imagery tile: a ground-plane quad (Z=0, matching FlexNetwork's own Ground-road
- * datum) spanning [WestCm,EastCm] x [SouthCm,NorthCm] in world-space centimeters, textured with
+ * datum) spanning world X=[SouthCm,NorthCm], Y=[WestCm,EastCm] in centimeters, textured with
  * one or two fetched LGL-BW layers via a dynamic material instance. Preview-only (placed in the
  * level so satellite/land-use imagery can be seen against the imported road network in-editor) --
  * "Bake Imagery To Content" (FlexSatelliteImageBaker.h) is what turns the underlying textures into

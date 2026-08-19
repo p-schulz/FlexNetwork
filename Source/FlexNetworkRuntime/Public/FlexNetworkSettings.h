@@ -71,12 +71,12 @@ public:
 	float ParallelApproachAngleToleranceDegrees = 30.f;
 
 	/**
-	 * Minimum clear road length (cm) needed between two junction trim boundaries before classic
-	 * generation is allowed to place sidewalk/curb between them. Below this, the junction surfaces
-	 * are bridged and the consumed roadside region is suppressed.
+	 * Optional extra clearance (cm) used when deciding whether two junction trim boundaries consume
+	 * the road section between them. At zero, sidewalk/curb suppression occurs only when the trims
+	 * touch or overlap. Increase this to deliberately merge nearby junction roadside regions.
 	 */
 	UPROPERTY(EditAnywhere, Config, Category = "Intersections", meta = (ClampMin = "0.0", Units = "cm"))
-	float CloseJunctionRoadsideClearance = 600.f;
+	float CloseJunctionRoadsideClearance = 0.f;
 
 	/**
 	 * Vertical offset (cm) every generated road/junction mesh sits above its own logical height --
@@ -98,6 +98,14 @@ public:
 	/** Chord-deviation tolerance (cm) that stops adaptive arc-length subdivision early. */
 	UPROPERTY(EditAnywhere, Config, Category = "Mesh", meta = (ClampMin = "0.01", Units = "cm"))
 	float ArcLengthChordTolerance = 2.f;
+
+	/**
+	 * Minimum area (cm^2) retained for boolean-generated road/sidewalk components and holes.
+	 * Applied only after road unification, so it removes residual slivers without changing the
+	 * source graph or junction merge behavior. Set to 0 to disable filtering.
+	 */
+	UPROPERTY(EditAnywhere, Config, Category = "Mesh", meta = (ClampMin = "0.0"))
+	double MinimumGeneratedPolygonArea = 10000.0;
 
 	/**
 	 * Optional actor subclass spawned for every segment. A Blueprint subclass can preconfigure the

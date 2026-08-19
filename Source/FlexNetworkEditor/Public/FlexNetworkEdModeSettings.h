@@ -11,6 +11,17 @@ class UOsmDataAsset;
 class UMaterialInterface;
 class UStaticMesh;
 class AFlexSatelliteTileActor;
+class UMassTrafficLightInstancesDataAsset;
+class UMassTrafficLightTypesDataAsset;
+
+/** Active viewport manipulation tool when Draw Mode is disabled. */
+UENUM()
+enum class EFlexNetworkNodeEditTool : uint8
+{
+	Move UMETA(DisplayName = "Move Node"),
+	Rotate UMETA(DisplayName = "Rotate Node + Connected Tangents"),
+	Tangent UMETA(DisplayName = "Adjust Tangent Handles")
+};
 
 /**
  * Transient per-editor-session settings for the FlexNetwork drawing tool, shown in its toolkit
@@ -36,8 +47,12 @@ public:
 	 * When off ("Select" mode): click an existing node to select it, then drag the viewport
 	 * gizmo to move it.
 	 */
-	UPROPERTY(EditAnywhere, Category = "FlexNetwork", meta = (DisplayName = "Draw Mode (off = Select/Move)"))
+	UPROPERTY(EditAnywhere, Category = "FlexNetwork", meta = (DisplayName = "Draw Mode (off = Node Edit)"))
 	bool bDrawModeActive = true;
+
+	/** Selects how the viewport gizmo edits the currently-selected node when Draw Mode is off. */
+	UPROPERTY(EditAnywhere, Category = "FlexNetwork", meta = (EditCondition = "!bDrawModeActive"))
+	EFlexNetworkNodeEditTool NodeEditTool = EFlexNetworkNodeEditTool::Move;
 
 	/** Road type profile new segments are drawn with. */
 	UPROPERTY(EditAnywhere, Category = "FlexNetwork")
@@ -51,20 +66,103 @@ public:
 	UPROPERTY(EditAnywhere, Category = "FlexNetwork")
 	bool bAngleSnapEnabled = true;
 
-	/** Parsed OSM data (import a .osm file via Content Browser > Import first) to generate roads from. */
+	/** Parsed OSM data (import a .osm file via Content Browser > Import first) to generate roads and railways from. */
 	UPROPERTY(EditAnywhere, Category = "OSM Import")
 	TObjectPtr<UOsmDataAsset> OsmAsset;
 
 	UPROPERTY(EditAnywhere, Category = "OSM Import", meta = (ShowOnlyInnerProperties))
 	FFlexOsmImportSettings OsmImportSettings;
 
-	/** Filters OsmAsset's ways by highway tag, projects to world space, merges nearby junction nodes, and builds matching FlexNetwork roads + auto-generated lane profiles. See FFlexOsmGraphBuilder. */
+	/** Publishes this asset/settings pair to the level so BuildingGrammar uses the identical source and projection. */
+	UPROPERTY(EditAnywhere, Category = "OSM Import|Shared Context")
+	bool bPublishSharedOsmContext = true;
+
+	UFUNCTION(CallInEditor, Category = "OSM Import|Shared Context", meta = (DisplayName = "Publish OSM Context To Level"))
+	void PublishOsmContextToLevel();
+
+	UFUNCTION(CallInEditor, Category = "OSM Import|Shared Context", meta = (DisplayName = "Load OSM Context From Level"))
+	void LoadOsmContextFromLevel();
+
+	UPROPERTY(VisibleAnywhere, Category = "OSM Import|Shared Context", meta = (MultiLine = true))
+	FString OsmContextStatus = TEXT("No shared OSM context has been published in this editor session.");
+
+	/** Imports only configured highway ways, projects them to world space, and builds matching FlexNetwork road segments and generated profiles. */
 	UFUNCTION(CallInEditor, Category = "OSM Import", meta = (DisplayName = "Generate Roads From OSM"))
 	void GenerateRoadsFromOsm();
+
+	/** Imports only configured railway ways and builds matching train/tram FlexNetwork segments and generated rail profiles. */
+	UFUNCTION(CallInEditor, Category = "OSM Import|Railways", meta = (DisplayName = "Generate Rails From OSM"))
+	void GenerateRailsFromOsm();
 
 	/** Rebuilds every road, sidewalk, junction and segment visualization from authoritative graph data. */
 	UFUNCTION(CallInEditor, Category = "FlexNetwork", meta = (DisplayName = "Rebuild All Network Geometry"))
 	void RebuildAllNetworkGeometry();
+
+	/** Stores the current authored graph in a persistent level actor so PIE/runtime worlds can reconstruct all transient representations and query data. Save the level after baking. */
+	UFUNCTION(CallInEditor, Category = "FlexNetwork|Bake", meta = (DisplayName = "Bake Network To Level"))
+	void BakeNetworkToLevel();
+
+	/** Replaces the current transient graph from the level's baked snapshot. */
+	UFUNCTION(CallInEditor, Category = "FlexNetwork|Bake", meta = (DisplayName = "Restore Baked Network"))
+	void RestoreBakedNetwork();
+
+	/** Removes baked snapshot actors without clearing the currently loaded transient network. */
+	UFUNCTION(CallInEditor, Category = "FlexNetwork|Bake", meta = (DisplayName = "Remove Network Bake"))
+	void RemoveNetworkBake();
+
+	UPROPERTY(VisibleAnywhere, Category = "FlexNetwork|Bake", meta = (MultiLine = true))
+	FString BakeStatus = TEXT("No network has been baked in this editor session.");
+
+	/** Distance between ZoneShape control points sampled along FlexNetwork Bezier segments and junction connectors. */
+	UPROPERTY(EditAnywhere, Category = "Mass AI|ZoneGraph", meta = (ClampMin = "10.0", Units = "cm"))
+	float ZoneGraphSampleSpacing = 200.f;
+
+	/** Exports generated roadside sidewalks, junction corner walks, and crosswalks for MassCrowd. */
+	UPROPERTY(EditAnywhere, Category = "Mass AI|ZoneGraph")
+	bool bZoneGraphIncludePedestrians = true;
+
+	/** Removes only the ZoneShape/ZoneGraphData actors generated by an earlier FlexNetwork export. */
+	UPROPERTY(EditAnywhere, Category = "Mass AI|ZoneGraph")
+	bool bZoneGraphReplaceExisting = true;
+
+	/** Registers the shared tags and updates MassTraffic/MassCrowd filters and speed-limit buckets. */
+	UPROPERTY(EditAnywhere, Category = "Mass AI|ZoneGraph")
+	bool bZoneGraphConfigureMassAI = true;
+
+	/** Generate the MassTraffic light-instances asset from FlexNetwork's authoritative controls. */
+	UPROPERTY(EditAnywhere, Category = "Mass AI|Traffic Signals")
+	bool bGenerateMassTrafficSignalsWithZoneGraph = true;
+
+	/** Optional visual types; City Sample's types or a generated placeholder are used when unset. */
+	UPROPERTY(EditAnywhere, Category = "Mass AI|Traffic Signals")
+	TObjectPtr<UMassTrafficLightTypesDataAsset> MassTrafficLightTypes;
+
+	UPROPERTY(EditAnywhere, Category = "Mass AI|Traffic Signals")
+	FString MassTrafficLightInstancesAssetName = TEXT("DA_FlexNetworkTrafficLights");
+
+	/** Regenerates only the MassTraffic signal instances asset; no ZoneGraph geometry is touched. */
+	UFUNCTION(CallInEditor, Category = "Mass AI|Traffic Signals", meta = (DisplayName = "Generate MassTraffic Signals"))
+	void GenerateMassTrafficSignals();
+
+	UPROPERTY(VisibleAnywhere, Category = "Mass AI|Traffic Signals")
+	TObjectPtr<UMassTrafficLightTypesDataAsset> GeneratedMassTrafficLightTypes;
+
+	UPROPERTY(VisibleAnywhere, Category = "Mass AI|Traffic Signals")
+	TObjectPtr<UMassTrafficLightInstancesDataAsset> GeneratedMassTrafficLightInstances;
+
+	UPROPERTY(VisibleAnywhere, Category = "Mass AI|Traffic Signals", meta = (MultiLine = true))
+	FString MassTrafficSignalStatus = TEXT("No MassTraffic signal asset has been generated in this editor session.");
+
+	/** Converts current FlexNetwork road lanes, junction lane connectors, sidewalks, and crosswalks into ZoneGraph and bakes it into this level. */
+	UFUNCTION(CallInEditor, Category = "Mass AI|ZoneGraph", meta = (DisplayName = "Generate Mass AI ZoneGraph"))
+	void GenerateMassAIZoneGraph();
+
+	/** Removes only ZoneGraph actors previously generated by FlexNetwork. */
+	UFUNCTION(CallInEditor, Category = "Mass AI|ZoneGraph", meta = (DisplayName = "Remove FlexNetwork ZoneGraph"))
+	void RemoveMassAIZoneGraph();
+
+	UPROPERTY(VisibleAnywhere, Category = "Mass AI|ZoneGraph", meta = (MultiLine = true))
+	FString ZoneGraphStatus = TEXT("No ZoneGraph has been generated by FlexNetwork in this editor session.");
 
 	/** Flattens/blends the landscape under every Ground road to match the road's height (Bridge/Elevated/Tunnel/Ramp roads are left alone). Forces a re-apply even for roads that weren't just edited -- e.g. after hand-sculpting the landscape since the last change. */
 	UFUNCTION(CallInEditor, Category = "Terrain", meta = (DisplayName = "Conform Terrain To Roads"))
@@ -98,7 +196,11 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Curbstones")
 	TObjectPtr<UStaticMesh> CurbstoneMesh;
 
-	/** Replaces every previously-generated curbstone with a fresh set spline-fit along the current road/junction curb lines using CurbstoneMesh. A manual step (not run automatically on every edit) since it can place a lot of components for a large network. */
+	/** Generates the configured curbstones once when a hand-drawn road chain is completed with right-click/Escape. Intermediate placement clicks remain lightweight. */
+	UPROPERTY(EditAnywhere, Category = "Curbstones")
+	bool bGenerateCurbstonesOnPlacementComplete = true;
+
+	/** Replaces every previously-generated curbstone with a fresh set spline-fit along the current road/junction curb lines using CurbstoneMesh. */
 	UFUNCTION(CallInEditor, Category = "Curbstones", meta = (DisplayName = "Generate Curbstones"))
 	void GenerateCurbstones();
 
@@ -106,8 +208,8 @@ public:
 	 * Fetches LGL-BW aerial (and, if UFlexSatelliteImagerySettings::bFetchLandUseOverlay is on,
 	 * land-use) imagery covering OsmAsset's own extent and spawns one flat preview tile per fetched
 	 * square (see AFlexSatelliteTileActor) -- reuses OsmAsset/OsmImportSettings above as-is, so the
-	 * imagery lands on the exact same projection origin "Generate Roads From OSM" would use for the
-	 * same asset/settings, and lines up with roads generated from it. Project-wide service URLs,
+	 * imagery lands on the exact same projection origin the road and rail OSM commands use for
+	 * the same asset/settings, and lines up with generated transport geometry. Project-wide service URLs,
 	 * layer names, and tiling parameters live in Project Settings under "Flex Network - Satellite
 	 * Imagery" (UFlexSatelliteImagerySettings). Replaces any previously-spawned satellite tiles.
 	 */
@@ -129,4 +231,8 @@ public:
 
 	/** Set by FFlexNetworkEdMode when it creates/fetches this settings object, so the CallInEditor buttons above have a world to act on. */
 	TWeakObjectPtr<UWorld> TargetWorld;
+
+private:
+	/** Shared implementation for the separate road and railway toolkit commands. */
+	void GenerateTransportFromOsm(bool bIncludeRoads, bool bIncludeRailways);
 };

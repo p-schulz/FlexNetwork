@@ -172,7 +172,8 @@ struct FLEXNETWORKRUNTIME_API FFlexJunctionMeshResult
  * Classic renderer output after all road and junction footprints have been boolean-unified.
  * Sidewalks and curbs are deliberately derived from the exposed boundary of Roadway instead of
  * being extruded independently by segments/junctions, which prevents either layer from entering
- * a drivable surface when trims change.
+ * a drivable surface when trims change. Curb-only suppression regions create crosswalk/curb-cut
+ * gaps without punching corresponding holes through the sidewalk surface.
  */
 USTRUCT()
 struct FLEXNETWORKRUNTIME_API FFlexUnifiedNetworkMeshResult

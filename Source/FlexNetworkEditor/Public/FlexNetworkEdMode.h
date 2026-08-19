@@ -8,12 +8,14 @@
 class UFlexNetworkSubsystem;
 class UFlexNetworkEdModeSettings;
 class FScopedTransaction;
+enum class EFlexNetworkNodeEditTool : uint8;
 
 extern const FEditorModeID FlexNetworkEdModeId;
 
 /**
  * Interactive road authoring tool: a click-click drawing gesture (not click-drag -- see
- * UFlexNetworkEdModeSettings::bDrawModeActive) plus classic-gizmo node selection/movement, both
+ * UFlexNetworkEdModeSettings::bDrawModeActive) plus classic-gizmo node move/rotation and
+ * per-segment endpoint-tangent editing, all
  * built on a real world raycast (landscape/mesh collision, with an ortho-camera-aware ray and a
  * flat-plane fallback for an empty level) rather than a flat-plane assumption. Legacy FEdMode
  * rather than the modern UEdMode/Interactive-Tools-Framework stack -- see
@@ -39,8 +41,8 @@ public:
 	virtual void AddReferencedObjects(FReferenceCollector& Collector) override;
 	virtual FString GetReferencerName() const override { return TEXT("FFlexNetworkEdMode"); }
 
-	// Node-selection gizmo (FLegacyEdModeWidgetHelper hooks -- the same mechanism Landscape/BSP/
-	// etc. use for the classic move widget).
+	// Node-selection gizmos (FLegacyEdModeWidgetHelper hooks -- the same mechanism Landscape/BSP/
+	// etc. use for classic translate/rotate widgets).
 	virtual bool ShouldDrawWidget() const override;
 	virtual FVector GetWidgetLocation() const override;
 	virtual bool AllowWidgetMove() override;
@@ -76,11 +78,14 @@ private:
 
 	FFlexBezierCurve PreviewCurve;
 	bool bPreviewValid = false;
+	bool bPlacementCommittedSegment = false;
 	FText PreviewInvalidReason;
 
-	FFlexNodeId SelectedNodeId; // Drives the transform-widget hooks above for click-select + gizmo-drag node movement.
+	FFlexNodeId SelectedNodeId; // Drives the transform-widget hooks for move/rotate/tangent editing.
 	FFlexSegmentId SelectedSegmentId; // Click-select only -- a segment has no single position, so no gizmo movement for it.
-	TUniquePtr<FScopedTransaction> ActiveNodeMoveTransaction;
+	FFlexSegmentId SelectedTangentSegmentId;
+	bool bSelectedTangentIsStart = false;
+	TUniquePtr<FScopedTransaction> ActiveNodeEditTransaction;
 
 	/** Deletes whichever of SelectedNodeId/SelectedSegmentId is currently valid (node takes priority, matching HandleClick's mutual exclusivity), wrapped in one undo transaction. */
 	void DeleteSelection();
@@ -89,6 +94,9 @@ private:
 
 	UFlexNetworkSubsystem* GetSubsystem() const;
 	bool IsDrawModeActive() const;
+	EFlexNetworkNodeEditTool GetNodeEditTool() const;
+	/** Resolves the explicitly selected tangent, or the first connected endpoint handle as a fallback. */
+	bool ResolveActiveTangentHandle(FFlexSegmentId& OutSegmentId, bool& bOutStartHandle, FVector& OutHandlePosition) const;
 
 	/**
 	 * Casts a real ray into the world (landscape/static-mesh collision on the editor visibility

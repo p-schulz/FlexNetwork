@@ -15,7 +15,7 @@
 #include "EngineUtils.h"
 #include "Misc/Paths.h"
 
-// Reproduces UFlexNetworkEdModeSettings::GenerateRoadsFromOsm's exact code path -- including the
+// Reproduces UFlexNetworkEdModeSettings::GenerateRoadsFromOsm's road-only code path -- including the
 // REAL asset-saving profile resolver (FlexNetworkAssetUtils::CreateRoadTypeProfileAsset), not the
 // transient in-memory one FlexNetwork.Osm.BuildGraph/RealFileSmokeTest use -- and additionally
 // verifies actual mesh geometry gets applied to the world, not just graph data. Exists to isolate
@@ -57,6 +57,7 @@ bool FFlexOsmEditorGenerateTest::RunTest(const FString& Parameters)
 	}
 
 	FFlexOsmImportSettings Settings;
+	Settings.RailwayTags.Reset();
 
 	// The real resolver: creates+saves an actual URoadTypeProfile asset, exactly like the editor
 	// button does -- if profile *asset saving* is what's silently failing, this is what surfaces it.

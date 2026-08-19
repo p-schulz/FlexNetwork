@@ -32,6 +32,97 @@ namespace
 		AFlexNetworkSegmentActor* SegmentActor = nullptr;
 	};
 
+	struct FCurbClearanceRegion
+	{
+		FVector Center = FVector::ZeroVector;
+		FVector Along = FVector::ForwardVector;
+		FVector Across = FVector::RightVector;
+		FVector Up = FVector::UpVector;
+		float HalfLength = 0.f;
+		float HalfWidth = 0.f;
+	};
+
+	void GatherCrosswalkCurbClearances(const UFlexNetworkSubsystem& Network, TArray<FCurbClearanceRegion>& OutClearances)
+	{
+		OutClearances.Reset();
+		for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Network.GetAllNodes())
+		{
+			const FFlexJunctionData* Junction = Network.GetJunctionData(Pair.Key);
+			if (!Junction)
+			{
+				continue;
+			}
+			const FVector Up = Pair.Value.UpVector.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+			for (const FFlexCrosswalkPlacement& Crosswalk : Junction->Crosswalks)
+			{
+				if (Pair.Value.ComplexIntersectionRegionIndex != INDEX_NONE)
+				{
+					const FFlexRoadSegment* CrossedSegment = Network.GetSegment(Crosswalk.SegmentId);
+					const FFlexRoadNode* StartNode = CrossedSegment ? Network.GetNode(CrossedSegment->StartNodeId) : nullptr;
+					const FFlexRoadNode* EndNode = CrossedSegment ? Network.GetNode(CrossedSegment->EndNodeId) : nullptr;
+					if (StartNode && EndNode
+						&& StartNode->ComplexIntersectionRegionIndex == Pair.Value.ComplexIntersectionRegionIndex
+						&& EndNode->ComplexIntersectionRegionIndex == Pair.Value.ComplexIntersectionRegionIndex)
+					{
+						continue;
+					}
+				}
+				if (Crosswalk.Width <= KINDA_SMALL_NUMBER || Crosswalk.Length <= KINDA_SMALL_NUMBER)
+				{
+					continue;
+				}
+				const FVector Along = FVector::VectorPlaneProject(Crosswalk.CrossingDirection, Up).GetSafeNormal();
+				const FVector Across = FVector::CrossProduct(Up, Along).GetSafeNormal();
+				if (Along.IsNearlyZero() || Across.IsNearlyZero())
+				{
+					continue;
+				}
+				OutClearances.Add({ Crosswalk.Center, Along, Across, Up, Crosswalk.Length * 0.5f, Crosswalk.Width * 0.5f });
+			}
+		}
+	}
+
+	bool ClipSegmentToSlab(double Start, double End, double HalfExtent, double& InOutMinAlpha, double& InOutMaxAlpha)
+	{
+		const double Delta = End - Start;
+		if (FMath::Abs(Delta) <= UE_DOUBLE_SMALL_NUMBER)
+		{
+			return FMath::Abs(Start) <= HalfExtent;
+		}
+		double Enter = (-HalfExtent - Start) / Delta;
+		double Exit = (HalfExtent - Start) / Delta;
+		if (Enter > Exit)
+		{
+			Swap(Enter, Exit);
+		}
+		InOutMinAlpha = FMath::Max(InOutMinAlpha, Enter);
+		InOutMaxAlpha = FMath::Min(InOutMaxAlpha, Exit);
+		return InOutMinAlpha <= InOutMaxAlpha;
+	}
+
+	bool CurbSpanTouchesCrosswalk(const FVector& Start, const FVector& End, float CurbWidth, float CurbHeight,
+		TConstArrayView<FCurbClearanceRegion> Clearances)
+	{
+		constexpr double SidePadding = 5.0;
+		for (const FCurbClearanceRegion& Clearance : Clearances)
+		{
+			const FVector StartDelta = Start - Clearance.Center;
+			const FVector EndDelta = End - Clearance.Center;
+			double MinAlpha = 0.0;
+			double MaxAlpha = 1.0;
+			if (ClipSegmentToSlab(FVector::DotProduct(StartDelta, Clearance.Along), FVector::DotProduct(EndDelta, Clearance.Along),
+				Clearance.HalfLength + CurbWidth + SidePadding, MinAlpha, MaxAlpha)
+				&& ClipSegmentToSlab(FVector::DotProduct(StartDelta, Clearance.Across), FVector::DotProduct(EndDelta, Clearance.Across),
+					Clearance.HalfWidth + SidePadding, MinAlpha, MaxAlpha)
+				&& ClipSegmentToSlab(FVector::DotProduct(StartDelta, Clearance.Up), FVector::DotProduct(EndDelta, Clearance.Up),
+					FMath::Max(100.0, static_cast<double>(CurbHeight + CurbWidth)), MinAlpha, MaxAlpha))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	FFlexPCGSource ResolveSource(FPCGContext* Context)
 	{
 		FFlexPCGSource Result;
@@ -190,17 +281,30 @@ namespace
 		}
 	}
 
-	void AppendRoadCurbs(FFlexMeshSectionData& Section, const TArray<FFlexCurveFrame>& Frames, float RoadHalfWidth, float Width, float Height, float Chamfer)
+	double AppendRoadCurbs(FFlexMeshSectionData& Section, const TArray<FFlexCurveFrame>& Frames, float RoadMinOffset, float RoadMaxOffset,
+		float Width, float Height, float Chamfer, TConstArrayView<FCurbClearanceRegion> Clearances)
 	{
+		double TotalLength = 0.0;
 		for (int32 i = 0; i + 1 < Frames.Num(); ++i)
 		{
 			const FFlexCurveFrame& A = Frames[i];
 			const FFlexCurveFrame& B = Frames[i + 1];
-			AppendChamferedCurbSpan(Section, A.Position - A.Right * RoadHalfWidth, B.Position - B.Right * RoadHalfWidth,
-				-A.Right, -B.Right, A.Up, B.Up, Width, Height, Chamfer);
-			AppendChamferedCurbSpan(Section, A.Position + A.Right * RoadHalfWidth, B.Position + B.Right * RoadHalfWidth,
-				A.Right, B.Right, A.Up, B.Up, Width, Height, Chamfer);
+			const FVector LeftStart = A.Position + A.Right * RoadMinOffset;
+			const FVector LeftEnd = B.Position + B.Right * RoadMinOffset;
+			if (!CurbSpanTouchesCrosswalk(LeftStart, LeftEnd, Width, Height, Clearances))
+			{
+				AppendChamferedCurbSpan(Section, LeftStart, LeftEnd, -A.Right, -B.Right, A.Up, B.Up, Width, Height, Chamfer);
+				TotalLength += FVector::Distance(LeftStart, LeftEnd);
+			}
+			const FVector RightStart = A.Position + A.Right * RoadMaxOffset;
+			const FVector RightEnd = B.Position + B.Right * RoadMaxOffset;
+			if (!CurbSpanTouchesCrosswalk(RightStart, RightEnd, Width, Height, Clearances))
+			{
+				AppendChamferedCurbSpan(Section, RightStart, RightEnd, A.Right, B.Right, A.Up, B.Up, Width, Height, Chamfer);
+				TotalLength += FVector::Distance(RightStart, RightEnd);
+			}
 		}
+		return TotalLength;
 	}
 
 	bool GenerateSegments(FPCGContext* Context, bool bSidewalks)
@@ -212,15 +316,56 @@ namespace
 		if (!Network) { PCGE_LOG_C(Error, GraphAndLog, Context, NSLOCTEXT("FlexNetworkPCG", "NoWorld", "No FlexNetwork world subsystem is available.")); return true; }
 		FPCGMetadataAttribute<FString>* IdAttr = nullptr; FPCGMetadataAttribute<double>* LengthAttr = nullptr;
 		UPCGParamData* Info = MakeInfo(Context, IdAttr, LengthAttr);
+		bool bSourceRailActor = false;
+		bool bEmitUnifiedRails = !Source.SegmentActor;
+		if (!bSidewalks && Source.SegmentActor)
+		{
+			const FFlexRoadSegment* SourceSegment = Network->GetSegment(Source.SegmentActor->SegmentId);
+			bSourceRailActor = SourceSegment && SourceSegment->Profile && SourceSegment->Profile->bIsRailProfile;
+			if (bSourceRailActor)
+			{
+				FFlexSegmentId Owner = FFlexSegmentId::Invalid();
+				for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Network->GetAllSegments())
+				{
+					if (!Pair.Value.Profile || !Pair.Value.Profile->bIsRailProfile)
+					{
+						continue;
+					}
+					if (!Owner.IsValid() || Pair.Key.Index < Owner.Index
+						|| (Pair.Key.Index == Owner.Index && Pair.Key.Generation < Owner.Generation))
+					{
+						Owner = Pair.Key;
+					}
+				}
+				bEmitUnifiedRails = Owner == Source.SegmentActor->SegmentId;
+			}
+		}
+		if (!bSidewalks && bEmitUnifiedRails)
+		{
+			// The world-scoped PCG node emits profile-wide rail solids. Their outer pieces and
+			// groove cutters are unified before subtraction, which is essential at switches.
+			TArray<FFlexMeshSectionData> RailSections;
+			Network->BuildRailMeshResults(RailSections);
+			for (int32 RailIndex = 0; RailIndex < RailSections.Num(); ++RailIndex)
+			{
+				AddMesh(Context, RailSections[RailIndex], MeshPin,
+					FString::Printf(TEXT("FlexRailProfile:%d"), RailIndex));
+			}
+		}
 		for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Network->GetAllSegments())
 		{
 			if (Source.SegmentActor && Pair.Key != Source.SegmentActor->SegmentId) continue;
-			FFlexSegmentMeshResult Result;
-			if (!Network->BuildSegmentMeshResult(Pair.Key, Result)) continue;
 			const FString Id = Pair.Key.ToString();
-			AddMesh(Context, bSidewalks ? Result.Sidewalks : Result.Roadway, MeshPin, FString::Printf(TEXT("FlexSegmentId:%s"), *Id));
 			const int64 Key = Info->FindOrAddMetadataKey(FName(*Id));
 			IdAttr->SetValue(Key, Id); LengthAttr->SetValue(Key, Pair.Value.GetLength());
+			if (!bSidewalks && Pair.Value.Profile && Pair.Value.Profile->bIsRailProfile
+				&& (!Source.SegmentActor || bSourceRailActor))
+			{
+				continue;
+			}
+			FFlexSegmentMeshResult Result;
+			if (!Network->BuildSegmentMeshResult(Pair.Key, Result)) continue;
+			AddMesh(Context, bSidewalks ? Result.Sidewalks : Result.Roadway, MeshPin, FString::Printf(TEXT("FlexSegmentId:%s"), *Id));
 		}
 		AddInfo(Context, Info);
 		return true;
@@ -311,6 +456,8 @@ bool FPCGFlexCurbMeshesElement::ExecuteInternal(FPCGContext* Context) const
 	FPCGMetadataAttribute<double>* LengthAttr = nullptr;
 	UPCGParamData* Info = MakeInfo(Context, IdAttr, LengthAttr);
 	const float SampleStep = GetDefault<UFlexNetworkSettings>()->ArcLengthSampleStep;
+	TArray<FCurbClearanceRegion> CrosswalkClearances;
+	GatherCrosswalkCurbClearances(*Network, CrosswalkClearances);
 
 	if (Settings->bGenerateRoadCurbs)
 	{
@@ -319,6 +466,14 @@ bool FPCGFlexCurbMeshesElement::ExecuteInternal(FPCGContext* Context) const
 			if (Source.SegmentActor && Pair.Key != Source.SegmentActor->SegmentId) continue;
 			const FFlexRoadSegment& Segment = Pair.Value;
 			if (!Segment.Profile || Segment.Profile->CurbHeight <= KINDA_SMALL_NUMBER || !Segment.ArcLengthTable.IsValid()) continue;
+			const FFlexRoadNode* SegmentStartNode = Network->GetNode(Segment.StartNodeId);
+			const FFlexRoadNode* SegmentEndNode = Network->GetNode(Segment.EndNodeId);
+			if (SegmentStartNode && SegmentEndNode
+				&& SegmentStartNode->ComplexIntersectionRegionIndex != INDEX_NONE
+				&& SegmentStartNode->ComplexIntersectionRegionIndex == SegmentEndNode->ComplexIntersectionRegionIndex)
+			{
+				continue; // Routing-only interior link; the shared region owns its outside curb.
+			}
 			float TrimStart = 0.f, TrimEnd = 0.f;
 			if (!Network->GetSegmentTrimRange(Pair.Key, TrimStart, TrimEnd)) continue;
 			const FFlexRoadNode* StartNode = Network->GetNode(Segment.StartNodeId);
@@ -326,12 +481,14 @@ bool FPCGFlexCurbMeshesElement::ExecuteInternal(FPCGContext* Context) const
 				StartNode ? StartNode->UpVector : FVector::UpVector, SampleStep, TrimStart, TrimEnd);
 			FFlexMeshSectionData Curbs;
 			Curbs.Material = Segment.Profile->CurbMaterial ? Segment.Profile->CurbMaterial : Segment.Profile->SidewalkMaterial;
-			AppendRoadCurbs(Curbs, Frames, Segment.Profile->GetRoadwayHalfWidth(), Settings->CurbWidth, Segment.Profile->CurbHeight, Settings->ChamferSize);
+			const double GeneratedCurbLength = AppendRoadCurbs(Curbs, Frames,
+				Segment.Profile->GetRoadwayMinOffset(), Segment.Profile->GetRoadwayMaxOffset(), Settings->CurbWidth,
+				Segment.Profile->CurbHeight, Settings->ChamferSize, CrosswalkClearances);
 			const FString Id = Pair.Key.ToString();
 			AddMesh(Context, Curbs, MeshPin, FString::Printf(TEXT("FlexCurbSegmentId:%s"), *Id));
 			const int64 Key = Info->FindOrAddMetadataKey(FName(*(FString(TEXT("Curb_")) + Id)));
 			IdAttr->SetValue(Key, Id);
-			LengthAttr->SetValue(Key, FMath::Max(0.f, TrimEnd - TrimStart) * 2.0);
+			LengthAttr->SetValue(Key, GeneratedCurbLength);
 		}
 	}
 
@@ -341,6 +498,12 @@ bool FPCGFlexCurbMeshesElement::ExecuteInternal(FPCGContext* Context) const
 		{
 			const FFlexJunctionData* Junction = Network->GetJunctionData(Pair.Key);
 			if (!Junction || Junction->PolygonBoundary.Num() < 3) continue;
+			if (Pair.Value.ComplexIntersectionRegionIndex != INDEX_NONE)
+			{
+				// Per-portal polygons contain internal edges. The classic unified path generates the
+				// region's true outer curb; emitting these local curbs would put them on asphalt.
+				continue;
+			}
 			if (Source.SegmentActor)
 			{
 				if (!Pair.Value.ConnectedSegments.Contains(Source.SegmentActor->SegmentId)) continue;
@@ -364,9 +527,16 @@ bool FPCGFlexCurbMeshesElement::ExecuteInternal(FPCGContext* Context) const
 			if (!Profile || Profile->CurbHeight <= KINDA_SMALL_NUMBER) continue;
 			FFlexMeshSectionData Curbs;
 			Curbs.Material = Profile->CurbMaterial ? Profile->CurbMaterial : Profile->SidewalkMaterial;
-			FVector Centroid = FVector::ZeroVector;
-			for (const FVector& P : Junction->PolygonBoundary) Centroid += P;
-			Centroid /= Junction->PolygonBoundary.Num();
+			const FVector Up = Pair.Value.UpVector.GetSafeNormal(UE_SMALL_NUMBER, FVector::UpVector);
+			FVector PolygonNormal = FVector::ZeroVector;
+			const FVector Reference = Junction->PolygonBoundary[0];
+			for (int32 i = 0; i < Junction->PolygonBoundary.Num(); ++i)
+			{
+				PolygonNormal += FVector::CrossProduct(
+					Junction->PolygonBoundary[i] - Reference,
+					Junction->PolygonBoundary[(i + 1) % Junction->PolygonBoundary.Num()] - Reference);
+			}
+			const bool bCounterClockwise = FVector::DotProduct(PolygonNormal, Up) >= 0.f;
 			double TotalLength = 0.0;
 			for (int32 i = 0; i < Junction->PolygonBoundary.Num(); ++i)
 			{
@@ -374,9 +544,19 @@ bool FPCGFlexCurbMeshesElement::ExecuteInternal(FPCGContext* Context) const
 				if (!bIsCurb) continue;
 				const FVector& A = Junction->PolygonBoundary[i];
 				const FVector& B = Junction->PolygonBoundary[(i + 1) % Junction->PolygonBoundary.Num()];
-				FVector Outward = FVector::VectorPlaneProject((A + B) * 0.5f - Centroid, Pair.Value.UpVector).GetSafeNormal();
-				if (Outward.IsNearlyZero()) Outward = FVector::CrossProduct((B - A).GetSafeNormal(), Pair.Value.UpVector).GetSafeNormal();
-				AppendChamferedCurbSpan(Curbs, A, B, Outward, Outward, Pair.Value.UpVector, Pair.Value.UpVector,
+				if (CurbSpanTouchesCrosswalk(A, B, Settings->CurbWidth, Profile->CurbHeight, CrosswalkClearances))
+				{
+					continue;
+				}
+				const FVector Tangent = FVector::VectorPlaneProject(B - A, Up).GetSafeNormal();
+				const FVector Outward = bCounterClockwise
+					? FVector::CrossProduct(Tangent, Up).GetSafeNormal()
+					: FVector::CrossProduct(Up, Tangent).GetSafeNormal();
+				if (Outward.IsNearlyZero())
+				{
+					continue;
+				}
+				AppendChamferedCurbSpan(Curbs, A, B, Outward, Outward, Up, Up,
 					Settings->CurbWidth, Profile->CurbHeight, Settings->ChamferSize);
 				TotalLength += FVector::Distance(A, B);
 			}

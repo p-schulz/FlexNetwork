@@ -38,12 +38,18 @@ void FFlexNetworkEdMode::Enter()
 		Toolkit = MakeShareable(new FFlexNetworkEdModeToolkit);
 		Toolkit->Init(Owner->GetToolkitHost());
 	}
+	if (Owner)
+	{
+		Owner->SetWidgetMode(GetNodeEditTool() == EFlexNetworkNodeEditTool::Rotate
+			? UE::Widget::WM_Rotate
+			: UE::Widget::WM_Translate);
+	}
 }
 
 void FFlexNetworkEdMode::Exit()
 {
 	CancelPlacement();
-	ActiveNodeMoveTransaction.Reset();
+	ActiveNodeEditTransaction.Reset();
 
 	if (Toolkit.IsValid())
 	{
@@ -71,6 +77,7 @@ UFlexNetworkSubsystem* FFlexNetworkEdMode::GetSubsystem() const
 
 UFlexNetworkEdModeSettings* FFlexNetworkEdMode::GetOrCreateModeSettings() const
 {
+	const UWorld* PreviousWorld = ModeSettings ? ModeSettings->TargetWorld.Get() : nullptr;
 	if (!ModeSettings)
 	{
 		ModeSettings = NewObject<UFlexNetworkEdModeSettings>(GetTransientPackage(), NAME_None, RF_Transactional);
@@ -78,11 +85,17 @@ UFlexNetworkEdModeSettings* FFlexNetworkEdMode::GetOrCreateModeSettings() const
 	// Refreshed on every call, not just at creation: ModeSettings itself persists for the whole
 	// editor session (it's a member of this FFlexNetworkEdMode, which outlives any one level), so
 	// caching TargetWorld only once would go stale the moment the user changes/reloads levels
-	// while still in this mode -- silently pointing GenerateRoadsFromOsm() at a world that's no
+	// while still in this mode -- silently pointing the OSM road/rail commands at a world that's no
 	// longer the one being viewed. Every other operation (draw, select/move) already avoids this
 	// by calling GetWorld() fresh each time via GetSubsystem(); this keeps the OSM path consistent
 	// with that instead of being the one place with a caching bug.
 	ModeSettings->TargetWorld = GetWorld();
+	if (ModeSettings->TargetWorld.Get() != PreviousWorld)
+	{
+		// A saved level context is the initial value for this transient mode instance. This only runs
+		// on a world change, so it never overwrites edits the user is currently making in the panel.
+		ModeSettings->LoadOsmContextFromLevel();
+	}
 	if (UFlexNetworkSubsystem* Subsystem = GetSubsystem())
 	{
 		Subsystem->SetVisualizationMode(ModeSettings->VisualizationMode);
@@ -94,6 +107,68 @@ bool FFlexNetworkEdMode::IsDrawModeActive() const
 {
 	const UFlexNetworkEdModeSettings* Settings = GetOrCreateModeSettings();
 	return Settings && Settings->bDrawModeActive;
+}
+
+EFlexNetworkNodeEditTool FFlexNetworkEdMode::GetNodeEditTool() const
+{
+	const UFlexNetworkEdModeSettings* Settings = GetOrCreateModeSettings();
+	return Settings ? Settings->NodeEditTool : EFlexNetworkNodeEditTool::Move;
+}
+
+bool FFlexNetworkEdMode::ResolveActiveTangentHandle(FFlexSegmentId& OutSegmentId,
+	bool& bOutStartHandle, FVector& OutHandlePosition) const
+{
+	OutSegmentId = FFlexSegmentId::Invalid();
+	bOutStartHandle = false;
+	OutHandlePosition = FVector::ZeroVector;
+
+	const UFlexNetworkSubsystem* Subsystem = GetSubsystem();
+	const FFlexRoadNode* Node = Subsystem ? Subsystem->GetNode(SelectedNodeId) : nullptr;
+	if (!Node)
+	{
+		return false;
+	}
+
+	auto ResolveSegment = [Subsystem, this, &OutSegmentId, &bOutStartHandle, &OutHandlePosition](
+		const FFlexSegmentId SegmentId, const bool bPreferSelectedEndpoint) -> bool
+	{
+		const FFlexRoadSegment* Segment = Subsystem->GetSegment(SegmentId);
+		if (!Segment)
+		{
+			return false;
+		}
+		if (Segment->StartNodeId == SelectedNodeId
+			&& (!bPreferSelectedEndpoint || bSelectedTangentIsStart))
+		{
+			OutSegmentId = SegmentId;
+			bOutStartHandle = true;
+			OutHandlePosition = Segment->Curve.P1;
+			return true;
+		}
+		if (Segment->EndNodeId == SelectedNodeId
+			&& (!bPreferSelectedEndpoint || !bSelectedTangentIsStart))
+		{
+			OutSegmentId = SegmentId;
+			bOutStartHandle = false;
+			OutHandlePosition = Segment->Curve.P2;
+			return true;
+		}
+		return false;
+	};
+
+	if (SelectedTangentSegmentId.IsValid()
+		&& ResolveSegment(SelectedTangentSegmentId, true))
+	{
+		return true;
+	}
+	for (const FFlexSegmentId SegmentId : Node->ConnectedSegments)
+	{
+		if (ResolveSegment(SegmentId, false))
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 bool FFlexNetworkEdMode::TraceCursorToWorld(FEditorViewportClient* ViewportClient, FViewport* Viewport, int32 X, int32 Y, FVector& OutPoint) const
@@ -251,6 +326,7 @@ void FFlexNetworkEdMode::UpdatePreviewCurve()
 void FFlexNetworkEdMode::BeginPlacement()
 {
 	DrawState = EDrawState::Placing;
+	bPlacementCommittedSegment = false;
 	DrawStartPoint = HoverWorldPoint;
 	DrawStartNodeId = HoverNodeId;
 	DrawStartSegmentId = HoverSegmentId;
@@ -272,10 +348,23 @@ void FFlexNetworkEdMode::BeginPlacement()
 
 void FFlexNetworkEdMode::CancelPlacement()
 {
+	const bool bGenerateCompletedCurbstones = bPlacementCommittedSegment;
 	DrawState = EDrawState::Idle;
 	DrawStartNodeId = FFlexNodeId::Invalid();
 	DrawStartSegmentId = FFlexSegmentId::Invalid();
 	bPreviewValid = false;
+	bPlacementCommittedSegment = false;
+
+	// Curbstone spline meshes can be numerous, so defer their generation until the user ends the
+	// complete click-click road chain instead of rebuilding them after every committed segment.
+	if (bGenerateCompletedCurbstones)
+	{
+		if (UFlexNetworkEdModeSettings* Settings = GetOrCreateModeSettings();
+			Settings && Settings->bGenerateCurbstonesOnPlacementComplete && Settings->CurbstoneMesh)
+		{
+			Settings->GenerateCurbstones();
+		}
+	}
 }
 
 void FFlexNetworkEdMode::ReconcileCurveEndpoint(FFlexBezierCurve& Curve, bool bStart, FFlexNodeId NodeId) const
@@ -338,6 +427,7 @@ void FFlexNetworkEdMode::CommitPlacement()
 	}
 
 	FScopedTransaction Transaction(NSLOCTEXT("FlexNetwork", "DrawRoad", "Draw Flex Road"));
+	bool bCommittedThisClick = false;
 
 	// Resolve endpoints against the graph as it stood *before* this commit, so the crossing
 	// search below only ever considers pre-existing roads, never the one being added.
@@ -389,7 +479,8 @@ void FFlexNetworkEdMode::CommitPlacement()
 		}
 
 		ReconcileCurveEndpoint(LeftPiece, false, JunctionNodeId);
-		Subsystem->AddSegment(PreviousNodeId, JunctionNodeId, LeftPiece.P1, LeftPiece.P2, Settings->ActiveProfile, Settings->ActiveElevationType);
+		bCommittedThisClick |= Subsystem->AddSegment(PreviousNodeId, JunctionNodeId, LeftPiece.P1, LeftPiece.P2,
+			Settings->ActiveProfile, Settings->ActiveElevationType).IsValid();
 
 		PreviousNodeId = JunctionNodeId;
 		RemainingCurve = RightPiece;
@@ -397,7 +488,9 @@ void FFlexNetworkEdMode::CommitPlacement()
 		ConsumedArcLength = Crossing.ArcLengthOnProposedCurve;
 	}
 
-	Subsystem->AddSegment(PreviousNodeId, EndNodeId, RemainingCurve.P1, RemainingCurve.P2, Settings->ActiveProfile, Settings->ActiveElevationType);
+	bCommittedThisClick |= Subsystem->AddSegment(PreviousNodeId, EndNodeId, RemainingCurve.P1, RemainingCurve.P2,
+		Settings->ActiveProfile, Settings->ActiveElevationType).IsValid();
+	bPlacementCommittedSegment |= bCommittedThisClick;
 
 	// The new road's endpoint becomes the natural start of the next one -- continuing a chain of
 	// segments (e.g. drawing a winding street) doesn't need to re-click the same spot.
@@ -413,11 +506,37 @@ void FFlexNetworkEdMode::CommitPlacement()
 
 bool FFlexNetworkEdMode::ShouldDrawWidget() const
 {
-	return SelectedNodeId.IsValid();
+	if (!SelectedNodeId.IsValid() || IsDrawModeActive())
+	{
+		return false;
+	}
+	const UFlexNetworkSubsystem* Subsystem = GetSubsystem();
+	if (!Subsystem || !Subsystem->GetNode(SelectedNodeId))
+	{
+		return false;
+	}
+	if (GetNodeEditTool() == EFlexNetworkNodeEditTool::Tangent)
+	{
+		FFlexSegmentId SegmentId;
+		bool bStartHandle = false;
+		FVector HandlePosition;
+		return ResolveActiveTangentHandle(SegmentId, bStartHandle, HandlePosition);
+	}
+	return true;
 }
 
 FVector FFlexNetworkEdMode::GetWidgetLocation() const
 {
+	if (GetNodeEditTool() == EFlexNetworkNodeEditTool::Tangent)
+	{
+		FFlexSegmentId SegmentId;
+		bool bStartHandle = false;
+		FVector HandlePosition;
+		if (ResolveActiveTangentHandle(SegmentId, bStartHandle, HandlePosition))
+		{
+			return HandlePosition;
+		}
+	}
 	if (UFlexNetworkSubsystem* Subsystem = GetSubsystem())
 	{
 		if (const FFlexRoadNode* Node = Subsystem->GetNode(SelectedNodeId))
@@ -430,18 +549,23 @@ FVector FFlexNetworkEdMode::GetWidgetLocation() const
 
 bool FFlexNetworkEdMode::AllowWidgetMove()
 {
-	return SelectedNodeId.IsValid();
+	return ShouldDrawWidget();
 }
 
 bool FFlexNetworkEdMode::UsesTransformWidget() const
 {
-	return SelectedNodeId.IsValid();
+	return ShouldDrawWidget();
 }
 
 bool FFlexNetworkEdMode::UsesTransformWidget(UE::Widget::EWidgetMode CheckMode) const
 {
-	// Nodes only have a position, no rotation/scale -- only the translate widget makes sense.
-	return SelectedNodeId.IsValid() && CheckMode == UE::Widget::WM_Translate;
+	if (!ShouldDrawWidget())
+	{
+		return false;
+	}
+	return GetNodeEditTool() == EFlexNetworkNodeEditTool::Rotate
+		? CheckMode == UE::Widget::WM_Rotate
+		: CheckMode == UE::Widget::WM_Translate;
 }
 
 bool FFlexNetworkEdMode::HandleClick(FEditorViewportClient* InViewportClient, HHitProxy* HitProxy, const FViewportClick& Click)
@@ -453,10 +577,37 @@ bool FFlexNetworkEdMode::HandleClick(FEditorViewportClient* InViewportClient, HH
 		return false;
 	}
 
+	if (HitProxy && HitProxy->IsA(HFlexTangentHitProxy::StaticGetType()))
+	{
+		const HFlexTangentHitProxy* TangentProxy = static_cast<HFlexTangentHitProxy*>(HitProxy);
+		if (const UFlexNetworkSubsystem* Subsystem = GetSubsystem())
+		{
+			if (const FFlexRoadSegment* Segment = Subsystem->GetSegment(TangentProxy->SegmentId))
+			{
+				SelectedNodeId = TangentProxy->bStartHandle ? Segment->StartNodeId : Segment->EndNodeId;
+				SelectedSegmentId = FFlexSegmentId::Invalid();
+				SelectedTangentSegmentId = TangentProxy->SegmentId;
+				bSelectedTangentIsStart = TangentProxy->bStartHandle;
+				if (InViewportClient)
+				{
+					InViewportClient->SetWidgetMode(UE::Widget::WM_Translate);
+				}
+				return true;
+			}
+		}
+	}
+
 	if (HitProxy && HitProxy->IsA(HFlexNodeHitProxy::StaticGetType()))
 	{
 		SelectedNodeId = static_cast<HFlexNodeHitProxy*>(HitProxy)->NodeId;
 		SelectedSegmentId = FFlexSegmentId::Invalid();
+		SelectedTangentSegmentId = FFlexSegmentId::Invalid();
+		if (InViewportClient)
+		{
+			InViewportClient->SetWidgetMode(GetNodeEditTool() == EFlexNetworkNodeEditTool::Rotate
+				? UE::Widget::WM_Rotate
+				: UE::Widget::WM_Translate);
+		}
 		return true;
 	}
 
@@ -464,19 +615,27 @@ bool FFlexNetworkEdMode::HandleClick(FEditorViewportClient* InViewportClient, HH
 	{
 		SelectedSegmentId = static_cast<HFlexSegmentHitProxy*>(HitProxy)->SegmentId;
 		SelectedNodeId = FFlexNodeId::Invalid();
+		SelectedTangentSegmentId = FFlexSegmentId::Invalid();
 		return true;
 	}
 
 	SelectedNodeId = FFlexNodeId::Invalid();
 	SelectedSegmentId = FFlexSegmentId::Invalid();
+	SelectedTangentSegmentId = FFlexSegmentId::Invalid();
 	return FEdMode::HandleClick(InViewportClient, HitProxy, Click);
 }
 
 bool FFlexNetworkEdMode::StartTracking(FEditorViewportClient* InViewportClient, FViewport* InViewport)
 {
-	if (SelectedNodeId.IsValid())
+	if (ShouldDrawWidget())
 	{
-		ActiveNodeMoveTransaction = MakeUnique<FScopedTransaction>(NSLOCTEXT("FlexNetwork", "MoveNode", "Move Flex Road Node"));
+		const EFlexNetworkNodeEditTool Tool = GetNodeEditTool();
+		const FText TransactionText = Tool == EFlexNetworkNodeEditTool::Rotate
+			? NSLOCTEXT("FlexNetwork", "RotateNode", "Rotate Flex Road Node")
+			: Tool == EFlexNetworkNodeEditTool::Tangent
+				? NSLOCTEXT("FlexNetwork", "AdjustTangent", "Adjust Flex Road Tangent")
+				: NSLOCTEXT("FlexNetwork", "MoveNode", "Move Flex Road Node");
+		ActiveNodeEditTransaction = MakeUnique<FScopedTransaction>(TransactionText);
 		return true;
 	}
 	return FEdMode::StartTracking(InViewportClient, InViewport);
@@ -484,9 +643,9 @@ bool FFlexNetworkEdMode::StartTracking(FEditorViewportClient* InViewportClient, 
 
 bool FFlexNetworkEdMode::EndTracking(FEditorViewportClient* InViewportClient, FViewport* InViewport)
 {
-	if (ActiveNodeMoveTransaction.IsValid())
+	if (ActiveNodeEditTransaction.IsValid())
 	{
-		ActiveNodeMoveTransaction.Reset();
+		ActiveNodeEditTransaction.Reset();
 		return true;
 	}
 	return FEdMode::EndTracking(InViewportClient, InViewport);
@@ -494,16 +653,64 @@ bool FFlexNetworkEdMode::EndTracking(FEditorViewportClient* InViewportClient, FV
 
 bool FFlexNetworkEdMode::InputDelta(FEditorViewportClient* InViewportClient, FViewport* InViewport, FVector& InDrag, FRotator& InRot, FVector& InScale)
 {
-	if (SelectedNodeId.IsValid() && !InDrag.IsNearlyZero())
+	if (!SelectedNodeId.IsValid())
 	{
-		if (UFlexNetworkSubsystem* Subsystem = GetSubsystem())
+		return FEdMode::InputDelta(InViewportClient, InViewport, InDrag, InRot, InScale);
+	}
+
+	UFlexNetworkSubsystem* Subsystem = GetSubsystem();
+	if (!Subsystem)
+	{
+		return false;
+	}
+
+	switch (GetNodeEditTool())
+	{
+	case EFlexNetworkNodeEditTool::Move:
+		if (!InDrag.IsNearlyZero())
 		{
 			if (const FFlexRoadNode* Node = Subsystem->GetNode(SelectedNodeId))
 			{
 				Subsystem->SetNodePosition(SelectedNodeId, Node->Position + InDrag);
 			}
+			return true;
 		}
-		return true;
+		break;
+
+	case EFlexNetworkNodeEditTool::Rotate:
+		if (!InRot.IsNearlyZero())
+		{
+			Subsystem->RotateNode(SelectedNodeId, InRot.Quaternion());
+			return true;
+		}
+		break;
+
+	case EFlexNetworkNodeEditTool::Tangent:
+		if (!InDrag.IsNearlyZero())
+		{
+			FFlexSegmentId SegmentId;
+			bool bStartHandle = false;
+			FVector HandlePosition;
+			if (ResolveActiveTangentHandle(SegmentId, bStartHandle, HandlePosition))
+			{
+				if (const FFlexRoadSegment* Segment = Subsystem->GetSegment(SegmentId))
+				{
+					FVector StartHandle = Segment->Curve.P1;
+					FVector EndHandle = Segment->Curve.P2;
+					if (bStartHandle)
+					{
+						StartHandle += InDrag;
+					}
+					else
+					{
+						EndHandle += InDrag;
+					}
+					Subsystem->SetSegmentCurve(SegmentId, StartHandle, EndHandle);
+					return true;
+				}
+			}
+		}
+		break;
 	}
 	return FEdMode::InputDelta(InViewportClient, InViewport, InDrag, InRot, InScale);
 }
@@ -521,6 +728,7 @@ void FFlexNetworkEdMode::DeleteSelection()
 		FScopedTransaction Transaction(NSLOCTEXT("FlexNetwork", "DeleteNode", "Delete Flex Road Node"));
 		Subsystem->RemoveNode(SelectedNodeId); // Cascades to remove every segment still connected to it.
 		SelectedNodeId = FFlexNodeId::Invalid();
+		SelectedTangentSegmentId = FFlexSegmentId::Invalid();
 	}
 	else if (SelectedSegmentId.IsValid())
 	{
@@ -601,7 +809,7 @@ void FFlexNetworkEdMode::Render(const FSceneView* View, FViewport* Viewport, FPr
 		const bool bHovered = Pair.Key == HoverNodeId;
 		const FColor Color = bSelected ? FColor::Yellow : (bHovered ? FColor::Cyan : FColor::White);
 
-		// Hit-proxied so HandleClick can tell exactly which node was clicked (Select/Move mode);
+		// Hit-proxied so HandleClick can tell exactly which node was clicked (Node Edit mode);
 		// harmless to leave the proxy active in Draw mode too, since HandleClick there just
 		// returns false and defers to the placement click handled in InputKey instead.
 		PDI->SetHitProxy(new HFlexNodeHitProxy(Pair.Key));
@@ -609,7 +817,7 @@ void FFlexNetworkEdMode::Render(const FSceneView* View, FViewport* Viewport, FPr
 		PDI->SetHitProxy(nullptr);
 	}
 
-	// A thin hit-proxied line along each segment's curve so it can be click-selected (Select/Move
+	// A thin hit-proxied line along each segment's curve so it can be click-selected (node edit
 	// mode) even though the segment's own generated mesh has no hit proxy of its own -- the actual
 	// road mesh already shows the segment visually, so this stays unobtrusive except when selected.
 	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Subsystem->GetAllSegments())
@@ -629,6 +837,70 @@ void FFlexNetworkEdMode::Render(const FSceneView* View, FViewport* Viewport, FPr
 			Prev = Next;
 		}
 		PDI->SetHitProxy(nullptr);
+	}
+
+	if (!IsDrawModeActive() && SelectedNodeId.IsValid())
+	{
+		const FFlexRoadNode* SelectedNode = Subsystem->GetNode(SelectedNodeId);
+		if (SelectedNode && GetNodeEditTool() == EFlexNetworkNodeEditTool::Rotate)
+		{
+			// The node orientation consists of its local up vector plus the incident endpoint
+			// tangents. Showing both makes rotation edits legible even for a flat road where yaw
+			// leaves the up-vector indicator unchanged.
+			PDI->DrawLine(SelectedNode->Position,
+				SelectedNode->Position + SelectedNode->UpVector * 150.f,
+				FColor::Blue, SDPG_Foreground, 4.f);
+			for (const FFlexSegmentId SegmentId : SelectedNode->ConnectedSegments)
+			{
+				if (const FFlexRoadSegment* Segment = Subsystem->GetSegment(SegmentId))
+				{
+					if (Segment->StartNodeId == SelectedNodeId)
+					{
+						PDI->DrawLine(SelectedNode->Position, Segment->Curve.P1,
+							FColor::Orange, SDPG_Foreground, 3.f);
+					}
+					if (Segment->EndNodeId == SelectedNodeId)
+					{
+						PDI->DrawLine(SelectedNode->Position, Segment->Curve.P2,
+							FColor::Orange, SDPG_Foreground, 3.f);
+					}
+				}
+			}
+		}
+		else if (SelectedNode && GetNodeEditTool() == EFlexNetworkNodeEditTool::Tangent)
+		{
+			FFlexSegmentId ActiveSegmentId;
+			bool bActiveStartHandle = false;
+			FVector ActiveHandlePosition;
+			ResolveActiveTangentHandle(ActiveSegmentId, bActiveStartHandle, ActiveHandlePosition);
+
+			auto DrawHandle = [PDI, SelectedNode, &ActiveSegmentId, bActiveStartHandle](
+				const FFlexSegmentId SegmentId, const bool bStartHandle, const FVector& HandlePosition)
+			{
+				const bool bActive = SegmentId == ActiveSegmentId && bStartHandle == bActiveStartHandle;
+				const FColor Color = bActive ? FColor::Yellow : FColor::Magenta;
+				PDI->DrawLine(SelectedNode->Position, HandlePosition, Color,
+					SDPG_Foreground, bActive ? 4.f : 2.f);
+				PDI->SetHitProxy(new HFlexTangentHitProxy(SegmentId, bStartHandle));
+				PDI->DrawPoint(HandlePosition, Color, bActive ? 18.f : 14.f, SDPG_Foreground);
+				PDI->SetHitProxy(nullptr);
+			};
+
+			for (const FFlexSegmentId SegmentId : SelectedNode->ConnectedSegments)
+			{
+				if (const FFlexRoadSegment* Segment = Subsystem->GetSegment(SegmentId))
+				{
+					if (Segment->StartNodeId == SelectedNodeId)
+					{
+						DrawHandle(SegmentId, true, Segment->Curve.P1);
+					}
+					if (Segment->EndNodeId == SelectedNodeId)
+					{
+						DrawHandle(SegmentId, false, Segment->Curve.P2);
+					}
+				}
+			}
+		}
 	}
 
 	if (DrawState == EDrawState::Placing)

@@ -43,7 +43,8 @@ enum class EFlexLaneType : uint8
 	Parking,
 	Bike,
 	Sidewalk,
-	Median
+	Median,
+	Rail
 };
 
 /** Direction of travel a lane allows, relative to the segment's start->end parameterization. */

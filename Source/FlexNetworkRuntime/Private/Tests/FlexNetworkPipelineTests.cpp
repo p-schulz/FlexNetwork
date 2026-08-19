@@ -168,6 +168,27 @@ bool FFlexNetworkPipelineTest::RunTest(const FString& Parameters)
 		}
 	}
 
+	// --- Node rotation and manual endpoint-tangent adjustment use authoritative mutation APIs. ---
+	const FFlexNodeId EditA = Subsystem->AddNode(FVector(10000, 50000, 0));
+	const FFlexNodeId EditB = Subsystem->AddNode(FVector(12000, 50000, 0));
+	const FFlexSegmentId EditSegment = Subsystem->AddSegment(EditA, EditB,
+		FVector(10700, 50000, 0), FVector(11300, 50000, 0), NarrowProfile);
+	TestTrue(TEXT("Node rotation succeeds"), Subsystem->RotateNode(EditA,
+		FQuat(FVector::UpVector, FMath::DegreesToRadians(90.f))));
+	if (const FFlexRoadSegment* RotatedSegment = Subsystem->GetSegment(EditSegment))
+	{
+		TestTrue(TEXT("Node rotation rotates its connected start tangent about the endpoint"),
+			RotatedSegment->Curve.P1.Equals(FVector(10000, 50700, 0), 0.1f));
+		const FVector AdjustedStartHandle = RotatedSegment->Curve.P1 + FVector(100, 50, 0);
+		TestTrue(TEXT("Manual tangent adjustment succeeds"), Subsystem->SetSegmentCurve(
+			EditSegment, AdjustedStartHandle, RotatedSegment->Curve.P2));
+		if (const FFlexRoadSegment* AdjustedSegment = Subsystem->GetSegment(EditSegment))
+		{
+			TestTrue(TEXT("Manual tangent adjustment stores the moved endpoint handle"),
+				AdjustedSegment->Curve.P1.Equals(AdjustedStartHandle, 0.1f));
+		}
+	}
+
 	// --- Incremental rebuild: editing one segment's profile touches far fewer segments than the whole network. ---
 	const int32 TotalSegmentsBeforeProfileEdit = Subsystem->GetAllSegments().Num();
 	TArray<FFlexSegmentId> LastChangedSegments;

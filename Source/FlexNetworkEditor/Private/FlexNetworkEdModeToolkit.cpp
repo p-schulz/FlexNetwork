@@ -39,8 +39,11 @@ void FFlexNetworkEdModeToolkit::Init(const TSharedPtr<IToolkitHost>& InitToolkit
 				"Clicking on/near an existing node or road snaps and connects to it; drawing across "
 				"an existing road splits it automatically. Green preview = valid, red = invalid "
 				"(too short, too sharp, or self-intersecting). Right-click/Escape cancels.\n\n"
-				"Select/Move Mode (toggle off Draw Mode below): click a node to select it (yellow), "
-				"then drag the viewport gizmo to move it."))
+				"Node Edit Mode (toggle off Draw Mode below): choose Move Node, Rotate Node + "
+				"Connected Tangents, or Adjust Tangent Handles. Click a node to select it (yellow). "
+				"Move uses the translate gizmo; Rotate changes the node up vector and rotates every "
+				"connected endpoint tangent together; Tangent mode shows magenta handles--click one, "
+				"then drag its translate gizmo."))
 		]
 		+ SVerticalBox::Slot()
 		.FillHeight(1.f)

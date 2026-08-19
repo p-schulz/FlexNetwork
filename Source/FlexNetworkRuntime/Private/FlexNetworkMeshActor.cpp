@@ -204,6 +204,7 @@ void AFlexNetworkMeshActor::ApplyUnifiedNetworkMesh(const FFlexUnifiedNetworkMes
 
 void AFlexNetworkMeshActor::ApplyCurbstones(const TArray<TArray<FVector>>& CurbLines, UStaticMesh* Mesh)
 {
+	AppliedCurbstoneMesh = Mesh;
 	for (USplineMeshComponent* Comp : CurbstoneComponents)
 	{
 		if (Comp)
@@ -217,6 +218,11 @@ void AFlexNetworkMeshActor::ApplyCurbstones(const TArray<TArray<FVector>>& CurbL
 	{
 		return;
 	}
+	// Curb lines are oriented so spline-local +Y points out of the roadway. Move the spline by the
+	// negative local-Y minimum of the mesh bounds: centered meshes shift outward by half their
+	// width, edge-pivoted meshes remain on their authored boundary, and no mesh width enters asphalt.
+	const FBoxSphereBounds MeshBounds = Mesh->GetBounds();
+	const float OutwardOffset = MeshBounds.BoxExtent.Y - MeshBounds.Origin.Y;
 
 	int32 NameCounter = 0;
 	for (const TArray<FVector>& Line : CurbLines)
@@ -234,14 +240,18 @@ void AFlexNetworkMeshActor::ApplyCurbstones(const TArray<TArray<FVector>>& CurbL
 			{
 				continue;
 			}
+			const FVector Outward = FVector::CrossProduct(FVector::UpVector, Tangent.GetSafeNormal()).GetSafeNormal();
+			const FVector ShiftedStart = Start + Outward * OutwardOffset;
+			const FVector ShiftedEnd = End + Outward * OutwardOffset;
 
 			USplineMeshComponent* Comp = NewObject<USplineMeshComponent>(this, *FString::Printf(TEXT("Curbstone_%d"), NameCounter++));
 			Comp->SetMobility(EComponentMobility::Movable);
 			Comp->SetStaticMesh(Mesh);
 			Comp->SetForwardAxis(ESplineMeshAxis::X);
+			Comp->SetSplineUpDir(FVector::UpVector, false);
 			Comp->SetupAttachment(RootSceneComponent);
 			Comp->RegisterComponent();
-			Comp->SetStartAndEnd(Start, Tangent, End, Tangent, true);
+			Comp->SetStartAndEnd(ShiftedStart, Tangent, ShiftedEnd, Tangent, true);
 			CurbstoneComponents.Add(Comp);
 		}
 	}

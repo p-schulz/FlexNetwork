@@ -49,6 +49,10 @@ struct FLEXNETWORKRUNTIME_API FFlexCrosswalkPlacement
 {
 	GENERATED_BODY()
 
+	/** Approach whose roadway is crossed. Retained so complex regions can discard interior crossings. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FlexNetwork")
+	FFlexSegmentId SegmentId;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FlexNetwork")
 	FVector Center = FVector::ZeroVector;
 

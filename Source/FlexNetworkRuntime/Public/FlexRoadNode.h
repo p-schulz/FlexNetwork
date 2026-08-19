@@ -35,6 +35,14 @@ struct FLEXNETWORKRUNTIME_API FFlexRoadNode
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "FlexNetwork")
 	float FilletRadiusOverride = 0.f;
 
+	/**
+	 * Nodes sharing a non-negative index are distinct routing portals of one compact OSM
+	 * intersection region. They retain their positions/headings; geometry consumes the short
+	 * links between them into one surface instead of contracting every portal to a centroid.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "FlexNetwork")
+	int32 ComplexIntersectionRegionIndex = INDEX_NONE;
+
 	bool HasRole(EFlexNodeRole Role) const { return (RoleFlags & static_cast<uint8>(Role)) != 0; }
 	bool IsJunction() const { return HasRole(EFlexNodeRole::Junction); }
 };

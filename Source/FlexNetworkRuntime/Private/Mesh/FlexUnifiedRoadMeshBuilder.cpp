@@ -3,6 +3,7 @@
 #include "CompGeom/Delaunay2.h"
 #include "Curve/GeneralPolygon2.h"
 #include "Curve/PolygonIntersectionUtils.h"
+#include "Curve/PolygonOffsetUtils.h"
 #include "Materials/MaterialInterface.h"
 #include "Polygon2.h"
 
@@ -13,6 +14,10 @@ namespace
 	constexpr double MinEdgeLengthSquared = 0.01;
 	constexpr float UvScale = 0.01f;
 	constexpr double MaxCurbEdgeLength = 100.0;
+	constexpr double SidewalkWidthGroupTolerance = 0.1; // cm
+	constexpr double SidewalkOffsetMiterLimit = 2.0;
+	constexpr double SidewalkOffsetMaxStepsPerRadian = 6.0;
+	constexpr double SidewalkOffsetRoundScale = 0.001;
 
 	struct FSurfaceSupport
 	{
@@ -54,6 +59,13 @@ namespace
 		if (FMath::Abs(Outer.SignedArea()) <= UE_DOUBLE_SMALL_NUMBER)
 		{
 			return false;
+		}
+		// GeometryAlgorithms uses Clipper's NonZero fill rule. Oppositely-wound subject paths
+		// cancel where they overlap, so every standalone road/junction/suppression footprint must
+		// enter the boolean pass with the same outer-ring orientation.
+		if (Outer.IsClockwise())
+		{
+			Outer.Reverse();
 		}
 		OutPolygon = FGeneralPolygon2d(Outer);
 		return true;
@@ -175,6 +187,75 @@ namespace
 		}
 	}
 
+	void FilterTinyPolygonComponents(TArray<FGeneralPolygon2d>& Polygons, double MinimumArea)
+	{
+		if (MinimumArea <= UE_DOUBLE_SMALL_NUMBER)
+		{
+			return;
+		}
+		for (int32 PolygonIndex = Polygons.Num() - 1; PolygonIndex >= 0; --PolygonIndex)
+		{
+			FGeneralPolygon2d& Polygon = Polygons[PolygonIndex];
+			if (FMath::Abs(Polygon.GetOuter().SignedArea()) < MinimumArea)
+			{
+				Polygons.RemoveAtSwap(PolygonIndex);
+			}
+		}
+	}
+
+	void FilterTinyPolygonFeatures(TArray<FGeneralPolygon2d>& Polygons, double MinimumArea)
+	{
+		FilterTinyPolygonComponents(Polygons, MinimumArea);
+		for (FGeneralPolygon2d& Polygon : Polygons)
+		{
+			Polygon.FilterHoles([MinimumArea](const FPolygon2d& Hole)
+			{
+				return MinimumArea > UE_DOUBLE_SMALL_NUMBER && FMath::Abs(Hole.SignedArea()) < MinimumArea;
+			});
+		}
+	}
+
+	void SimplifyPolygonRings(TArray<FGeneralPolygon2d>& Polygons)
+	{
+		// Boolean and offset operations can retain long runs that are collinear to sub-millimetre
+		// precision. Feeding those redundant constraints into Delaunay can produce degenerate
+		// alternating edge triangles. Simplify far below any visible geometry tolerance.
+		constexpr double ClusterTolerance = 0.1;       // cm
+		constexpr double LineDeviationTolerance = 0.1; // cm
+		for (int32 PolygonIndex = Polygons.Num() - 1; PolygonIndex >= 0; --PolygonIndex)
+		{
+			FGeneralPolygon2d& Polygon = Polygons[PolygonIndex];
+			FPolygon2d Outer = Polygon.GetOuter();
+			Outer.Simplify(ClusterTolerance, LineDeviationTolerance);
+			if (Outer.VertexCount() < 3 || FMath::Abs(Outer.SignedArea()) <= UE_DOUBLE_SMALL_NUMBER)
+			{
+				Polygons.RemoveAtSwap(PolygonIndex);
+				continue;
+			}
+			if (Outer.IsClockwise())
+			{
+				Outer.Reverse();
+			}
+			FGeneralPolygon2d Simplified(Outer);
+			for (const FPolygon2d& SourceHole : Polygon.GetHoles())
+			{
+				FPolygon2d Hole = SourceHole;
+				Hole.Simplify(ClusterTolerance, LineDeviationTolerance);
+				if (Hole.VertexCount() >= 3 && FMath::Abs(Hole.SignedArea()) > UE_DOUBLE_SMALL_NUMBER)
+				{
+					if (!Hole.IsClockwise())
+					{
+						Hole.Reverse();
+					}
+					// Recheck containment after simplification instead of forwarding a malformed hole
+					// into the next NonZero boolean or constrained triangulation pass.
+					Simplified.AddHole(MoveTemp(Hole), true, true);
+				}
+			}
+			Polygon = MoveTemp(Simplified);
+		}
+	}
+
 	bool IsSuppressed(const FVector2d& Point, TConstArrayView<FGeneralPolygon2d> SuppressionPolygons)
 	{
 		for (const FGeneralPolygon2d& Polygon : SuppressionPolygons)
@@ -187,37 +268,68 @@ namespace
 		return false;
 	}
 
-	void AddStripPolygon(const FVector2d& A, const FVector2d& B, const FVector2d& Offset, TArray<FGeneralPolygon2d>& OutPolygons)
+	struct FSidewalkWidthGroup
 	{
-		TArray<FVector2d> Vertices{ A, B, B + Offset, A + Offset };
-		FGeneralPolygon2d Polygon;
-		if (MakePolygon(TArray<FVector>{
-			FVector(Vertices[0].X, Vertices[0].Y, 0.f), FVector(Vertices[1].X, Vertices[1].Y, 0.f),
-			FVector(Vertices[2].X, Vertices[2].Y, 0.f), FVector(Vertices[3].X, Vertices[3].Y, 0.f) }, Polygon))
-		{
-			OutPolygons.Add(MoveTemp(Polygon));
-		}
-	}
+		double Width = 0.0;
+		TArray<FGeneralPolygon2d> Polygons;
+	};
 
-	void AddCornerPolygon(const FVector2d& Center, const FVector2d& Outward, double Radius, TArray<FGeneralPolygon2d>& OutPolygons)
+	void AddSidewalkSourcePolygon(const FGeneralPolygon2d& Polygon, double Width, TArray<FSidewalkWidthGroup>& OutGroups)
 	{
-		if (Radius <= UE_DOUBLE_SMALL_NUMBER)
+		if (Width <= KINDA_SMALL_NUMBER)
 		{
 			return;
 		}
-		TArray<FVector> Points;
-		constexpr int32 Steps = 8;
-		Points.Reserve(Steps);
-		const double BaseAngle = FMath::Atan2(Outward.Y, Outward.X);
-		for (int32 Step = 0; Step < Steps; ++Step)
+
+		FSidewalkWidthGroup* Group = OutGroups.FindByPredicate([Width](const FSidewalkWidthGroup& Candidate)
 		{
-			const double Angle = BaseAngle + UE_TWO_PI * static_cast<double>(Step) / Steps;
-			Points.Add(FVector(Center.X + FMath::Cos(Angle) * Radius, Center.Y + FMath::Sin(Angle) * Radius, 0.f));
+			return FMath::IsNearlyEqual(Candidate.Width, Width, SidewalkWidthGroupTolerance);
+		});
+		if (!Group)
+		{
+			Group = &OutGroups.AddDefaulted_GetRef();
+			Group->Width = Width;
 		}
-		FGeneralPolygon2d Polygon;
-		if (MakePolygon(Points, Polygon))
+		Group->Polygons.Add(Polygon);
+	}
+
+	void BuildOffsetSidewalkPolygons(TConstArrayView<FSidewalkWidthGroup> WidthGroups, double MinimumPolygonArea,
+		TArray<FGeneralPolygon2d>& OutBufferedPolygons)
+	{
+		for (const FSidewalkWidthGroup& Group : WidthGroups)
 		{
-			OutPolygons.Add(MoveTemp(Polygon));
+			if (Group.Polygons.IsEmpty())
+			{
+				continue;
+			}
+
+			// Union first so internal segment and junction seams never become offset boundaries.
+			// Separate width groups retain road-profile-specific sidewalk widths; their buffers are
+			// merged below before the complete unified roadway is subtracted.
+			TArray<FGeneralPolygon2d> UnifiedGroupPolygons;
+			PolygonsUnion(Group.Polygons, UnifiedGroupPolygons, true);
+			FilterTinyPolygonFeatures(UnifiedGroupPolygons, MinimumPolygonArea);
+			SimplifyPolygonRings(UnifiedGroupPolygons);
+			if (UnifiedGroupPolygons.IsEmpty())
+			{
+				continue;
+			}
+
+			TArray<FGeneralPolygon2d> OffsetPolygons;
+			const bool bOffsetSucceeded = PolygonsOffset(
+				Group.Width,
+				UnifiedGroupPolygons,
+				OffsetPolygons,
+				false,
+				SidewalkOffsetMiterLimit,
+				EPolygonOffsetJoinType::Round,
+				EPolygonOffsetEndType::Polygon,
+				SidewalkOffsetMaxStepsPerRadian,
+				SidewalkOffsetRoundScale);
+			if (bOffsetSucceeded)
+			{
+				OutBufferedPolygons.Append(MoveTemp(OffsetPolygons));
+			}
 		}
 	}
 
@@ -237,8 +349,19 @@ namespace
 		const FVector Tangent = (B - A).GetSafeNormal(UE_SMALL_NUMBER, FVector::ForwardVector);
 		const float Length = FVector::Distance(A, B) * UvScale;
 		TArray<FVector> CurbLine;
-		CurbLine.Add(A);
-		CurbLine.Add(B);
+		// Normalize line direction so a spline mesh's local +Y (world Up x forward) always points
+		// away from the roadway. ApplyCurbstones can then place an arbitrary-pivot mesh wholly on
+		// the sidewalk side instead of letting half of its width straddle the road edge.
+		if (FVector::DotProduct(FVector::CrossProduct(FVector::UpVector, Tangent), Normal) >= 0.f)
+		{
+			CurbLine.Add(A);
+			CurbLine.Add(B);
+		}
+		else
+		{
+			CurbLine.Add(B);
+			CurbLine.Add(A);
+		}
 		OutCurbLines.Add(MoveTemp(CurbLine));
 		const FResolvedSurface MidSurface = ResolveSurface((A2d + B2d) * 0.5, Supports);
 		UMaterialInterface* Material = MidSurface.Input
@@ -259,7 +382,9 @@ namespace
 		}
 	}
 
-	void BuildBoundaryGeometry(const FGeneralPolygon2d& RoadPolygon, TConstArrayView<FSurfaceSupport> Supports, TConstArrayView<FGeneralPolygon2d> SuppressionPolygons, TArray<FGeneralPolygon2d>& OutRawSidewalkPolygons, TArray<FFlexMeshSectionData>& OutCurbs, TArray<TArray<FVector>>& OutCurbLines)
+	void BuildBoundaryCurbs(const FGeneralPolygon2d& RoadPolygon, TConstArrayView<FSurfaceSupport> Supports,
+		TConstArrayView<FGeneralPolygon2d> SuppressionPolygons, TArray<FFlexMeshSectionData>& OutCurbs,
+		TArray<TArray<FVector>>& OutCurbLines)
 	{
 		const bool bOuterClockwise = RoadPolygon.OuterIsClockwise();
 		auto VisitRing = [&](const FPolygon2d& Ring)
@@ -276,13 +401,6 @@ namespace
 				}
 				const FVector2d Left(-Edge.Y, Edge.X);
 				const FVector2d Outward = (bOuterClockwise ? Left : -Left).GetSafeNormal();
-				const FVector2d Midpoint = (A + B) * 0.5;
-				const FResolvedSurface Surface = ResolveSurface(Midpoint, Supports);
-				if (Surface.SidewalkWidth > KINDA_SMALL_NUMBER)
-				{
-					AddStripPolygon(A, B, Outward * Surface.SidewalkWidth, OutRawSidewalkPolygons);
-					AddCornerPolygon(A, Outward, Surface.SidewalkWidth, OutRawSidewalkPolygons);
-				}
 				const int32 CurbSteps = FMath::Max(1, FMath::CeilToInt(Edge.Length() / MaxCurbEdgeLength));
 				for (int32 Step = 0; Step < CurbSteps; ++Step)
 				{
@@ -306,7 +424,7 @@ namespace
 	}
 }
 
-FFlexUnifiedNetworkMeshResult FFlexUnifiedRoadMeshBuilder::Build(TConstArrayView<FFlexUnifiedRoadPolygonInput> SurfaceInputs, TConstArrayView<FFlexUnifiedRoadSuppressionInput> SuppressionInputs)
+FFlexUnifiedNetworkMeshResult FFlexUnifiedRoadMeshBuilder::Build(TConstArrayView<FFlexUnifiedRoadPolygonInput> SurfaceInputs, TConstArrayView<FFlexUnifiedRoadSuppressionInput> SuppressionInputs, double MinimumPolygonArea)
 {
 	FFlexUnifiedNetworkMeshResult Result;
 	if (SurfaceInputs.IsEmpty())
@@ -324,6 +442,7 @@ FFlexUnifiedNetworkMeshResult FFlexUnifiedRoadMeshBuilder::Build(TConstArrayView
 	{
 		TArray<FGeneralPolygon2d> InputPolygons;
 		TArray<FSurfaceSupport> Supports;
+		TArray<FSidewalkWidthGroup> SidewalkWidthGroups;
 		for (const FFlexUnifiedRoadPolygonInput& Input : SurfaceInputs)
 		{
 			if (Input.ElevationLayer != Layer)
@@ -333,6 +452,7 @@ FFlexUnifiedNetworkMeshResult FFlexUnifiedRoadMeshBuilder::Build(TConstArrayView
 			FGeneralPolygon2d Polygon;
 			if (MakePolygon(Input.Boundary, Polygon))
 			{
+				AddSidewalkSourcePolygon(Polygon, Input.SidewalkWidth, SidewalkWidthGroups);
 				InputPolygons.Add(MoveTemp(Polygon));
 				AddSupports(Input, Supports);
 			}
@@ -344,9 +464,12 @@ FFlexUnifiedNetworkMeshResult FFlexUnifiedRoadMeshBuilder::Build(TConstArrayView
 
 		TArray<FGeneralPolygon2d> UnifiedRoadPolygons;
 		PolygonsUnion(InputPolygons, UnifiedRoadPolygons, true);
+		FilterTinyPolygonFeatures(UnifiedRoadPolygons, MinimumPolygonArea);
+		SimplifyPolygonRings(UnifiedRoadPolygons);
 		AppendTriangulatedPolygons(UnifiedRoadPolygons, Supports, false, Result.Roadways);
 
-		TArray<FGeneralPolygon2d> SuppressionPolygons;
+		TArray<FGeneralPolygon2d> SidewalkSuppressionPolygons;
+		TArray<FGeneralPolygon2d> CurbSuppressionPolygons;
 		for (const FFlexUnifiedRoadSuppressionInput& Input : SuppressionInputs)
 		{
 			if (Input.ElevationLayer == Layer)
@@ -354,34 +477,53 @@ FFlexUnifiedNetworkMeshResult FFlexUnifiedRoadMeshBuilder::Build(TConstArrayView
 				FGeneralPolygon2d Polygon;
 				if (MakePolygon(Input.Boundary, Polygon))
 				{
-					SuppressionPolygons.Add(MoveTemp(Polygon));
+					if (Input.bSuppressSidewalks)
+					{
+						SidewalkSuppressionPolygons.Add(Polygon);
+					}
+					if (Input.bSuppressCurbs)
+					{
+						CurbSuppressionPolygons.Add(MoveTemp(Polygon));
+					}
 				}
 			}
 		}
-		if (SuppressionPolygons.Num() > 1)
+		auto UnionSuppressionPolygons = [](TArray<FGeneralPolygon2d>& Polygons)
 		{
-			TArray<FGeneralPolygon2d> UnifiedSuppression;
-			PolygonsUnion(SuppressionPolygons, UnifiedSuppression, true);
-			SuppressionPolygons = MoveTemp(UnifiedSuppression);
-		}
+			if (Polygons.Num() > 1)
+			{
+				TArray<FGeneralPolygon2d> Unified;
+				PolygonsUnion(Polygons, Unified, true);
+				Polygons = MoveTemp(Unified);
+			}
+		};
+		UnionSuppressionPolygons(SidewalkSuppressionPolygons);
+		UnionSuppressionPolygons(CurbSuppressionPolygons);
 
-		TArray<FGeneralPolygon2d> RawSidewalkPolygons;
 		for (const FGeneralPolygon2d& Polygon : UnifiedRoadPolygons)
 		{
-			BuildBoundaryGeometry(Polygon, Supports, SuppressionPolygons, RawSidewalkPolygons, Result.Curbs, Result.CurbLines);
+			BuildBoundaryCurbs(Polygon, Supports, CurbSuppressionPolygons, Result.Curbs, Result.CurbLines);
 		}
-		if (!RawSidewalkPolygons.IsEmpty())
+
+		TArray<FGeneralPolygon2d> BufferedRoadPolygons;
+		BuildOffsetSidewalkPolygons(SidewalkWidthGroups, MinimumPolygonArea, BufferedRoadPolygons);
+		if (!BufferedRoadPolygons.IsEmpty())
 		{
 			TArray<FGeneralPolygon2d> UnifiedSidewalkPolygons;
-			PolygonsUnion(RawSidewalkPolygons, UnifiedSidewalkPolygons, true);
+			PolygonsUnion(BufferedRoadPolygons, UnifiedSidewalkPolygons, true);
 			TArray<FGeneralPolygon2d> OutsideRoadPolygons;
 			PolygonsDifference(UnifiedSidewalkPolygons, UnifiedRoadPolygons, OutsideRoadPolygons);
-			if (!SuppressionPolygons.IsEmpty())
+			FilterTinyPolygonFeatures(OutsideRoadPolygons, MinimumPolygonArea);
+			if (!SidewalkSuppressionPolygons.IsEmpty())
 			{
 				TArray<FGeneralPolygon2d> UnsuppressedSidewalkPolygons;
-				PolygonsDifference(OutsideRoadPolygons, SuppressionPolygons, UnsuppressedSidewalkPolygons);
+				PolygonsDifference(OutsideRoadPolygons, SidewalkSuppressionPolygons, UnsuppressedSidewalkPolygons);
 				OutsideRoadPolygons = MoveTemp(UnsuppressedSidewalkPolygons);
 			}
+			// Suppression holes are intentional. Only discard tiny components created by the final
+			// subtraction; do not fill a small user/configuration-defined suppression region.
+			FilterTinyPolygonComponents(OutsideRoadPolygons, MinimumPolygonArea);
+			SimplifyPolygonRings(OutsideRoadPolygons);
 			AppendTriangulatedPolygons(OutsideRoadPolygons, Supports, true, Result.Sidewalks);
 		}
 	}

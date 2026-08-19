@@ -8,13 +8,9 @@ class UFlexNetworkSubsystem;
 /**
  * Extension point for exporting the FlexNetwork graph into another engine navigation/lane-graph
  * system (most notably UE5's built-in ZoneGraph plugin, which Epic's Mass traffic sample builds
- * on). Deliberately left unimplemented for now: the direct query API on UFlexNetworkSubsystem
- * (GetLaneAtArcLength, GetLaneConnectorsAtNode, etc.) is the primary integration path for this
- * project's own traffic simulation, and a project with its own graph representation is generally
- * better served by consuming that directly rather than round-tripping through ZoneGraph. If a
- * ZoneGraph export is wanted later, implement it as a class deriving from this interface (e.g.
- * FFlexZoneGraphExporter in a new FlexNetworkZoneGraph module, mirroring FlexNetworkEditor's
- * relationship to FlexNetworkRuntime) rather than adding a hard ZoneGraph dependency here.
+ * on). The optional FlexNetworkZoneGraph module now provides the full one-shot ZoneShape/bake
+ * pipeline used by the editor mode. It intentionally remains outside FlexNetworkRuntime so
+ * projects consuming the direct query API do not inherit ZoneGraph/MassTraffic dependencies.
  */
 class FLEXNETWORKRUNTIME_API IFlexNetworkExporter
 {

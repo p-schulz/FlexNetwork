@@ -12,8 +12,8 @@ struct FLEXNETWORKRUNTIME_API FFlexOsmBuildingRing
 };
 
 /**
- * Dependency-safe building-footprint transfer type. Coordinates use FlexNetwork's X=east,
- * Y=north convention but are expressed in meters for geometry consumers such as BuildingGrammar.
+ * Dependency-safe building-footprint transfer type. Coordinates use the shared Unreal map
+ * convention X=north/Y=east and are expressed in meters for consumers such as BuildingGrammar.
  */
 struct FLEXNETWORKRUNTIME_API FFlexOsmBuildingFootprint
 {

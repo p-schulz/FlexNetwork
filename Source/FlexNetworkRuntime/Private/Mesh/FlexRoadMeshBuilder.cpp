@@ -1,5 +1,6 @@
 #include "Mesh/FlexRoadMeshBuilder.h"
 #include "Math/FlexBezierMath.h"
+#include "Mesh/FlexRailMeshBuilder.h"
 
 namespace
 {
@@ -113,19 +114,28 @@ FFlexSegmentMeshResult FFlexRoadMeshBuilder::BuildSegmentMesh(const FFlexBezierC
 
 	const TArray<FFlexCurveFrame> Frames = BuildFramesForRange(Curve, ArcLengthTable, ReferenceUp, SampleStep, TrimStart, TrimEnd);
 
-	const float RoadwayHalfWidth = Profile->GetRoadwayHalfWidth();
 	Result.Roadway.Material = Profile->RoadMaterial;
-	if (RoadwayHalfWidth > KINDA_SMALL_NUMBER)
+	if (Profile->bIsRailProfile)
 	{
-		AppendExtrudedStrip(Result.Roadway, Frames, -RoadwayHalfWidth, RoadwayHalfWidth, 0.f);
+		FFlexRailSweepInput Sweep;
+		Sweep.Frames = Frames;
+		FFlexRailMeshBuilder::BuildRailMesh(MakeArrayView(&Sweep, 1), Profile, Result.Roadway);
+		return Result;
+	}
+
+	const float RoadwayMinOffset = Profile->GetRoadwayMinOffset();
+	const float RoadwayMaxOffset = Profile->GetRoadwayMaxOffset();
+	if (RoadwayMaxOffset - RoadwayMinOffset > KINDA_SMALL_NUMBER)
+	{
+		AppendExtrudedStrip(Result.Roadway, Frames, RoadwayMinOffset, RoadwayMaxOffset, 0.f);
 	}
 
 	if (Profile->SidewalkWidth > KINDA_SMALL_NUMBER)
 	{
 		Result.Sidewalks.Material = Profile->SidewalkMaterial;
 		// Sidewalks sit CurbHeight above the roadway surface and immediately outside its edges.
-		AppendExtrudedStrip(Result.Sidewalks, Frames, -RoadwayHalfWidth - Profile->SidewalkWidth, -RoadwayHalfWidth, Profile->CurbHeight);
-		AppendExtrudedStrip(Result.Sidewalks, Frames, RoadwayHalfWidth, RoadwayHalfWidth + Profile->SidewalkWidth, Profile->CurbHeight);
+		AppendExtrudedStrip(Result.Sidewalks, Frames, RoadwayMinOffset - Profile->SidewalkWidth, RoadwayMinOffset, Profile->CurbHeight);
+		AppendExtrudedStrip(Result.Sidewalks, Frames, RoadwayMaxOffset, RoadwayMaxOffset + Profile->SidewalkWidth, Profile->CurbHeight);
 	}
 
 	return Result;
