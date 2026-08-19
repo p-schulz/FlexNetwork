@@ -126,6 +126,38 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category = "Performance", meta = (ClampMin = "1"))
 	int32 ParallelRebuildThreshold = 4;
 
+	/** Starting distance (cm) FFlexTrackJunctionSolver trims each rail segment back from a junction node before solving movement curves between the resulting ports. */
+	UPROPERTY(EditAnywhere, Config, Category = "Rail", meta = (ClampMin = "1.0", Units = "cm"))
+	float RailJunctionTrimDistance = 1000.f;
+
+	/** Upper bound (cm) the rail junction solver's trim distance is allowed to grow to while retrying movements that fail their minimum-radius check. */
+	UPROPERTY(EditAnywhere, Config, Category = "Rail", meta = (ClampMin = "1.0", Units = "cm"))
+	float RailJunctionMaxTrimDistance = 2000.f;
+
+	/** How far the rail junction solver expands the trim distance on each retry. */
+	UPROPERTY(EditAnywhere, Config, Category = "Rail", meta = (ClampMin = "1.0", Units = "cm"))
+	float RailJunctionTrimDistanceStep = 300.f;
+
+	/** Maximum number of trim-distance retries the rail junction solver attempts per junction. */
+	UPROPERTY(EditAnywhere, Config, Category = "Rail", meta = (ClampMin = "1", ClampMax = "16"))
+	int32 RailJunctionMaxSolveIterations = 4;
+
+	/** Maximum lateral distance (cm) between two rail polylines for FFlexRailGraphBuilder to fold their shared span into one merged rail edge (e.g. the common leg of a turnout). */
+	UPROPERTY(EditAnywhere, Config, Category = "Rail", meta = (ClampMin = "0.1", Units = "cm"))
+	float RailMergeToleranceCm = 3.f;
+
+	/** Maximum tangent deviation (degrees) between two rail polylines for FFlexRailGraphBuilder to still treat them as coincident/mergeable rather than diverging. */
+	UPROPERTY(EditAnywhere, Config, Category = "Rail", meta = (ClampMin = "0.0", ClampMax = "90.0", Units = "deg"))
+	float RailMergeAngleToleranceDegrees = 10.f;
+
+	/** Minimum tangent angle (degrees) between two rail polylines that don't share a junction port for FFlexRailGraphBuilder to classify their intersection as a genuine crossing rather than a near-tangential touch. */
+	UPROPERTY(EditAnywhere, Config, Category = "Rail", meta = (ClampMin = "0.0", ClampMax = "90.0", Units = "deg"))
+	float RailCrossingAngleToleranceDegrees = 15.f;
+
+	/** Total visual gap (cm), split evenly between the two rails meeting at a crossing/switch/frog edge, that FFlexRailMeshBuilder trims instead of sweeping rail mesh all the way to the interaction point. */
+	UPROPERTY(EditAnywhere, Config, Category = "Rail", meta = (ClampMin = "0.0", Units = "cm"))
+	float RailCrossingGapCm = 4.f;
+
 #if WITH_EDITOR
 	virtual FText GetSectionText() const override;
 #endif

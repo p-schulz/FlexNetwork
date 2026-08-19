@@ -175,8 +175,11 @@ public:
 	bool BuildJunctionMeshResult(FFlexNodeId NodeId, FFlexJunctionMeshResult& OutResult) const;
 
 	/**
-	 * Builds rails grouped by profile across the complete graph. Outer solids and tram groove
-	 * cutters are unified before subtraction so switch/intersection geometry has no segment caps.
+	 * Builds rails grouped by profile across the complete graph. For each distinct rail profile,
+	 * derives a topology-first TrackGraph/RailGraph (see Rail/FlexTrackGraphBuilder.h,
+	 * Rail/FlexTrackJunctionSolver.h, Rail/FlexRailGraphBuilder.h) and sweeps its edges -- switches,
+	 * turnouts, and crossings are resolved as rail topology before any mesh is built, rather than
+	 * relying on mesh-boolean unions to keep junction geometry watertight.
 	 */
 	void BuildRailMeshResults(TArray<FFlexMeshSectionData>& OutResults) const;
 

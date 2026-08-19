@@ -10,6 +10,9 @@
 #include "Mesh/FlexRoadMeshBuilder.h"
 #include "Mesh/FlexRailMeshBuilder.h"
 #include "Mesh/FlexUnifiedRoadMeshBuilder.h"
+#include "Rail/FlexTrackGraphBuilder.h"
+#include "Rail/FlexTrackJunctionSolver.h"
+#include "Rail/FlexRailGraphBuilder.h"
 #include "Intersection/FlexIntersectionBuilder.h"
 #include "Terrain/FlexLandscapeConformer.h"
 #include "Engine/World.h"
@@ -1637,30 +1640,41 @@ bool UFlexNetworkSubsystem::BuildJunctionMeshResult(FFlexNodeId NodeId, FFlexJun
 void UFlexNetworkSubsystem::BuildRailMeshResults(TArray<FFlexMeshSectionData>& OutResults) const
 {
 	OutResults.Reset();
-	TMap<const URoadTypeProfile*, TArray<FFlexRailSweepInput>> SweepsByProfile;
 	const UFlexNetworkSettings* Settings = GetSettings();
+
+	// One independent TrackGraph/RailGraph per distinct rail profile: two differently-gauged rail
+	// lines meeting at a node can't physically share a switch, so solving each profile's junctions
+	// separately is more correct than trying to merge them into one shared junction solve. This
+	// only reads Nodes/Segments -- it never mutates the shared graph roads also use, and never
+	// calls FFlexIntersectionBuilder.
+	TSet<const URoadTypeProfile*> RailProfiles;
 	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
 	{
-		const FFlexRoadSegment& Segment = Pair.Value;
-		if (!Segment.Profile || !Segment.Profile->bIsRailProfile || !Segment.ArcLengthTable.IsValid())
+		if (Pair.Value.Profile && Pair.Value.Profile->bIsRailProfile)
 		{
-			continue;
-		}
-		const FFlexRoadNode* StartNode = Nodes.Find(Segment.StartNodeId);
-		FFlexRailSweepInput Sweep;
-		Sweep.Frames = FFlexRoadMeshBuilder::BuildFramesForRange(Segment.Curve, Segment.ArcLengthTable,
-			StartNode ? StartNode->UpVector : FVector::UpVector, Settings->ArcLengthSampleStep,
-			0.f, Segment.GetLength());
-		if (Sweep.Frames.Num() >= 2)
-		{
-			SweepsByProfile.FindOrAdd(Segment.Profile.Get()).Add(MoveTemp(Sweep));
+			RailProfiles.Add(Pair.Value.Profile.Get());
 		}
 	}
 
-	for (const TPair<const URoadTypeProfile*, TArray<FFlexRailSweepInput>>& Pair : SweepsByProfile)
+	for (const URoadTypeProfile* Profile : RailProfiles)
 	{
+		const FFlexTrackGraph TrackGraph = FFlexTrackGraphBuilder::Build(*this, Profile);
+
+		TArray<FFlexTrackJunction> Junctions;
+		Junctions.Reserve(TrackGraph.JunctionNodeIds.Num());
+		for (FFlexNodeId JunctionNodeId : TrackGraph.JunctionNodeIds)
+		{
+			Junctions.Add(FFlexTrackJunctionSolver::Solve(JunctionNodeId, *this, Profile,
+				Settings->RailJunctionTrimDistance, Settings->RailJunctionMaxTrimDistance,
+				Settings->RailJunctionTrimDistanceStep, Settings->RailJunctionMaxSolveIterations));
+		}
+
+		const FFlexRailGraph RailGraph = FFlexRailGraphBuilder::Build(TrackGraph, Junctions, *this,
+			Settings->ArcLengthSampleStep, Settings->RailMergeToleranceCm, Settings->RailMergeAngleToleranceDegrees,
+			Settings->RailCrossingAngleToleranceDegrees);
+
 		FFlexMeshSectionData Section;
-		if (FFlexRailMeshBuilder::BuildRailMesh(Pair.Value, Pair.Key, Section))
+		if (FFlexRailMeshBuilder::BuildRailMesh(RailGraph, Profile, Settings->RailCrossingGapCm, Section))
 		{
 			OutResults.Add(MoveTemp(Section));
 		}

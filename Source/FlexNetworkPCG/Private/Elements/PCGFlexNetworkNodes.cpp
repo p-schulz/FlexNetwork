@@ -342,8 +342,8 @@ namespace
 		}
 		if (!bSidewalks && bEmitUnifiedRails)
 		{
-			// The world-scoped PCG node emits profile-wide rail solids. Their outer pieces and
-			// groove cutters are unified before subtraction, which is essential at switches.
+			// The world-scoped PCG node emits one profile-wide rail mesh per distinct rail profile,
+			// built from a topology-first TrackGraph/RailGraph so switches/crossings stay correct.
 			TArray<FFlexMeshSectionData> RailSections;
 			Network->BuildRailMeshResults(RailSections);
 			for (int32 RailIndex = 0; RailIndex < RailSections.Num(); ++RailIndex)

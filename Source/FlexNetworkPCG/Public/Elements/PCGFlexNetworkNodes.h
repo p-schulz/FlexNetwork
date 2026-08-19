@@ -13,7 +13,7 @@ public:
 #if WITH_EDITOR
 	virtual FName GetDefaultNodeName() const override { return TEXT("FlexRoadMeshes"); }
 	virtual FText GetDefaultNodeTitle() const override { return NSLOCTEXT("FlexNetworkPCG", "RoadTitle", "Flex Network: Road / Rail Meshes"); }
-	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "RoadTip", "Generates FlexNetwork road and railway dynamic meshes. World-scoped rail profiles are unified before grooved tram-rail boolean subtraction so switches remain continuous."); }
+	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "RoadTip", "Generates FlexNetwork road and railway dynamic meshes. Rail geometry is resolved topology-first (TrackGraph/RailGraph) per rail profile, so switches, turnouts, and crossings stay continuous without relying on mesh-boolean unions."); }
 	virtual EPCGSettingsType GetType() const override { return EPCGSettingsType::Spatial; }
 #endif
 	virtual TArray<FPCGPinProperties> InputPinProperties() const override { return {}; }

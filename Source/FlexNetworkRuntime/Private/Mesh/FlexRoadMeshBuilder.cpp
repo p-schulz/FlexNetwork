@@ -1,6 +1,7 @@
 #include "Mesh/FlexRoadMeshBuilder.h"
 #include "Math/FlexBezierMath.h"
 #include "Mesh/FlexRailMeshBuilder.h"
+#include "Rail/FlexRailGraph.h"
 
 namespace
 {
@@ -117,9 +118,26 @@ FFlexSegmentMeshResult FFlexRoadMeshBuilder::BuildSegmentMesh(const FFlexBezierC
 	Result.Roadway.Material = Profile->RoadMaterial;
 	if (Profile->bIsRailProfile)
 	{
-		FFlexRailSweepInput Sweep;
-		Sweep.Frames = Frames;
-		FFlexRailMeshBuilder::BuildRailMesh(MakeArrayView(&Sweep, 1), Profile, Result.Roadway);
+		// Single-segment preview (used by the per-segment visualization actor, independent of the
+		// graph-wide topology-first pipeline UFlexNetworkSubsystem::BuildRailMeshResults runs): just
+		// this one segment's two rails, with no junction/switch/crossing awareness.
+		FFlexRailGraph RailGraph;
+		const float RailCenterOffset = (Profile->RailGauge + Profile->RailWidth) * 0.5f;
+		for (const float Side : { -1.f, 1.f })
+		{
+			FFlexRailEdge Edge;
+			Edge.Type = ERailEdgeType::Normal;
+			Edge.bLeftRail = Side < 0.f;
+			Edge.Frames.Reserve(Frames.Num());
+			for (const FFlexCurveFrame& Frame : Frames)
+			{
+				FFlexCurveFrame OffsetFrame = Frame;
+				OffsetFrame.Position = Frame.Position + Frame.Right * (Side * RailCenterOffset);
+				Edge.Frames.Add(OffsetFrame);
+			}
+			RailGraph.Edges.Add(MoveTemp(Edge));
+		}
+		FFlexRailMeshBuilder::BuildRailMesh(RailGraph, Profile, 0.f, Result.Roadway);
 		return Result;
 	}
 

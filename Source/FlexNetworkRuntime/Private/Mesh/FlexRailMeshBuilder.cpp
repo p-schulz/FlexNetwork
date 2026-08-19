@@ -20,11 +20,7 @@ namespace
 	TArray<FFlexCurveFrame> ExtendEndFrames(TConstArrayView<FFlexCurveFrame> Source, float Overlap)
 	{
 		TArray<FFlexCurveFrame> Result;
-		Result.Reserve(Source.Num());
-		for (const FFlexCurveFrame& Frame : Source)
-		{
-			Result.Add(Frame);
-		}
+		Result.Append(Source.GetData(), Source.Num());
 		if (Result.Num() >= 2 && Overlap > 0.f)
 		{
 			Result[0].Position -= Result[0].Tangent.GetSafeNormal() * Overlap;
@@ -33,6 +29,7 @@ namespace
 		return Result;
 	}
 
+	/** Extrudes a closed Y-Z rectangle profile through Frames. CenterOffset shifts the profile along each frame's Right axis, relative to the frame's own (already rail-offset) position. */
 	FDynamicMesh3 BuildSweptSolid(TConstArrayView<FFlexCurveFrame> SourceFrames, float CenterOffset,
 		float BottomHalfWidth, float TopHalfWidth, float BottomHeight, float TopHeight, float EndOverlap)
 	{
@@ -91,36 +88,32 @@ namespace
 		Editor.AppendMesh(&Source, Mappings);
 	}
 
-	bool CombineSolid(FDynamicMesh3& Aggregate, FDynamicMesh3&& Solid)
+	/**
+	 * Trims Frames back by GapCm from each end, measured via the cumulative FFlexCurveFrame::
+	 * ArcLength every frame already carries from its source RMF chain. Used to open a visual gap
+	 * at a Crossing edge instead of sweeping all the way to the crossing point. Returns an empty
+	 * array if the gap would consume the whole edge.
+	 */
+	TArray<FFlexCurveFrame> TrimFramesByGap(TConstArrayView<FFlexCurveFrame> Frames, float GapCm)
 	{
-		if (Solid.TriangleCount() == 0)
+		if (Frames.Num() < 2 || GapCm <= 0.f)
 		{
-			return true;
+			TArray<FFlexCurveFrame> Unchanged;
+			Unchanged.Append(Frames.GetData(), Frames.Num());
+			return Unchanged;
 		}
-		if (Aggregate.TriangleCount() == 0)
-		{
-			Aggregate = MoveTemp(Solid);
-			return true;
-		}
-		if (!Aggregate.GetBounds().Intersects(Solid.GetBounds()))
-		{
-			AppendDisconnected(Aggregate, Solid);
-			return true;
-		}
+		const float StartArcLength = Frames[0].ArcLength + GapCm;
+		const float EndArcLength = Frames.Last().ArcLength - GapCm;
 
-		FDynamicMesh3 UnionMesh;
-		FMeshBoolean Boolean(&Aggregate, &Solid, &UnionMesh, FMeshBoolean::EBooleanOp::Union);
-		Boolean.SnapTolerance = 0.01;
-		Boolean.bWeldSharedEdges = true;
-		Boolean.bSimplifyAlongNewEdges = false;
-		if (!Boolean.Compute() || UnionMesh.TriangleCount() == 0)
+		TArray<FFlexCurveFrame> Trimmed;
+		for (const FFlexCurveFrame& Frame : Frames)
 		{
-			// A malformed source span must not make otherwise valid rails disappear.
-			AppendDisconnected(Aggregate, Solid);
-			return false;
+			if (Frame.ArcLength >= StartArcLength && Frame.ArcLength <= EndArcLength)
+			{
+				Trimmed.Add(Frame);
+			}
 		}
-		Aggregate = MoveTemp(UnionMesh);
-		return true;
+		return Trimmed.Num() >= 2 ? Trimmed : TArray<FFlexCurveFrame>();
 	}
 
 	void ConvertToSection(const FDynamicMesh3& Mesh, UMaterialInterface* Material, FFlexMeshSectionData& OutSection)
@@ -174,74 +167,77 @@ namespace
 	}
 }
 
-bool FFlexRailMeshBuilder::BuildRailMesh(TConstArrayView<FFlexRailSweepInput> Sweeps,
-	const URoadTypeProfile* Profile, FFlexMeshSectionData& OutSection)
+bool FFlexRailMeshBuilder::BuildRailMesh(const FFlexRailGraph& RailGraph, const URoadTypeProfile* Profile,
+	float RailCrossingGapCm, FFlexMeshSectionData& OutSection)
 {
 	OutSection = FFlexMeshSectionData();
-	if (!Profile || !Profile->bIsRailProfile || Sweeps.IsEmpty())
+	if (!Profile || !Profile->bIsRailProfile || RailGraph.Edges.IsEmpty())
 	{
 		return false;
 	}
 
-	FDynamicMesh3 OuterRails;
-	FDynamicMesh3 GrooveCutters;
 	const float BaseHalfWidth = FMath::Max(Profile->RailWidth * 0.5f, 0.5f);
 	const float TopHalfWidth = FMath::Clamp(Profile->RailTopWidth * 0.5f, 0.5f, BaseHalfWidth);
 	const float RailHeight = FMath::Max(Profile->RailHeight, 0.5f);
-	const float HalfRailCenterSpacing = (Profile->RailGauge + Profile->RailWidth) * 0.5f;
 	const float GrooveHalfWidth = FMath::Clamp(Profile->RailGrooveWidth * 0.5f, 0.25f, TopHalfWidth - 0.1f);
 	const float GrooveInwardOffset = FMath::Clamp(Profile->RailGrooveInwardOffset, 0.f,
 		FMath::Max(0.f, TopHalfWidth - GrooveHalfWidth - 0.1f));
 	const float GrooveBottom = FMath::Clamp(RailHeight - Profile->RailGrooveDepth, 0.1f, RailHeight - 0.1f);
 	const float CutterTop = RailHeight + FMath::Max(Profile->RailBooleanOverlap, 0.1f);
 
-	for (const FFlexRailSweepInput& Sweep : Sweeps)
+	FDynamicMesh3 FinalMesh;
+
+	for (const FFlexRailEdge& Edge : RailGraph.Edges)
 	{
-		if (Sweep.Frames.Num() < 2)
+		TArray<FFlexCurveFrame> Frames = Edge.Frames;
+		if (Edge.Type == ERailEdgeType::Crossing || Edge.Type == ERailEdgeType::SwitchBlade || Edge.Type == ERailEdgeType::Frog)
+		{
+			// Split the configured total gap between the two edges meeting at the interaction point.
+			Frames = TrimFramesByGap(Frames, RailCrossingGapCm * 0.5f);
+		}
+		if (Frames.Num() < 2)
 		{
 			continue;
 		}
-		for (const FRoadLaneDescriptor& Track : Profile->Lanes)
+
+		// Every FFlexRailEdge is already offset to one physical rail's own centerline (see
+		// FFlexRailGraphBuilder), so the outer solid is centered directly on the frame with no
+		// further lateral offset, and needs no end overlap: adjacent edges meet at bit-identical
+		// shared-anchor frame positions, so their caps already sit flush against each other.
+		FDynamicMesh3 OuterRail = BuildSweptSolid(Frames, 0.f, BaseHalfWidth, TopHalfWidth, 0.f, RailHeight, 0.f);
+		if (OuterRail.TriangleCount() == 0)
 		{
-			if (!Track.IsRail())
+			continue;
+		}
+
+		if (Profile->bUseGroovedRailProfile)
+		{
+			// Shift toward the track center, mirrored per rail side, leaving the wider shoulder on
+			// each rail's outside -- matches the previous whole-graph implementation's cutter offset.
+			const float RailSide = Edge.bLeftRail ? -1.f : 1.f;
+			const float CutterCenterOffset = -RailSide * GrooveInwardOffset;
+			const FDynamicMesh3 Cutter = BuildSweptSolid(Frames, CutterCenterOffset, GrooveHalfWidth, GrooveHalfWidth,
+				GrooveBottom, CutterTop, Profile->RailBooleanOverlap);
+			if (Cutter.TriangleCount() > 0)
 			{
-				continue;
-			}
-			const float TrackCenter = Profile->GetLaneLateralOffset(Track);
-			for (const float RailSide : { -1.f, 1.f })
-			{
-				const float RailCenter = TrackCenter + RailSide * HalfRailCenterSpacing;
-				CombineSolid(OuterRails, BuildSweptSolid(Sweep.Frames, RailCenter, BaseHalfWidth, TopHalfWidth,
-					0.f, RailHeight, Profile->RailBooleanOverlap));
-				if (Profile->bUseGroovedRailProfile)
+				FDynamicMesh3 DifferenceMesh;
+				FMeshBoolean Difference(&OuterRail, &Cutter, &DifferenceMesh, FMeshBoolean::EBooleanOp::Difference);
+				Difference.SnapTolerance = 0.01;
+				Difference.bWeldSharedEdges = true;
+				Difference.bSimplifyAlongNewEdges = false;
+				if (Difference.Compute() && DifferenceMesh.TriangleCount() > 0)
 				{
-					// Shift toward the track center. This leaves the right rail's wider shoulder on
-					// its right and the left rail's wider shoulder on its left, as on tram rails.
-					const float CutterCenter = RailCenter - RailSide * GrooveInwardOffset;
-					CombineSolid(GrooveCutters, BuildSweptSolid(Sweep.Frames, CutterCenter, GrooveHalfWidth,
-						GrooveHalfWidth, GrooveBottom, CutterTop, Profile->RailBooleanOverlap * 2.f));
+					OuterRail = MoveTemp(DifferenceMesh);
 				}
 			}
 		}
+
+		AppendDisconnected(FinalMesh, OuterRail);
 	}
 
-	if (OuterRails.TriangleCount() == 0)
+	if (FinalMesh.TriangleCount() == 0)
 	{
 		return false;
-	}
-
-	FDynamicMesh3 FinalMesh = MoveTemp(OuterRails);
-	if (Profile->bUseGroovedRailProfile && GrooveCutters.TriangleCount() > 0)
-	{
-		FDynamicMesh3 DifferenceMesh;
-		FMeshBoolean Difference(&FinalMesh, &GrooveCutters, &DifferenceMesh, FMeshBoolean::EBooleanOp::Difference);
-		Difference.SnapTolerance = 0.01;
-		Difference.bWeldSharedEdges = true;
-		Difference.bSimplifyAlongNewEdges = false;
-		if (Difference.Compute() && DifferenceMesh.TriangleCount() > 0)
-		{
-			FinalMesh = MoveTemp(DifferenceMesh);
-		}
 	}
 
 	ConvertToSection(FinalMesh, Profile->RoadMaterial.Get(), OutSection);
