@@ -33,7 +33,10 @@ URoadTypeProfile* FlexNetworkAssetUtils::CreateRoadTypeProfileAsset(const FStrin
 	return Profile;
 }
 
-int32 FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(UMaterialInterface* RoadMaterial, UMaterialInterface* SidewalkMaterial, UMaterialInterface* CrosswalkMaterial, UMaterialInterface* JunctionMaterial, UMaterialInterface* MedianMaterial)
+int32 FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(UMaterialInterface* RoadMaterial, UMaterialInterface* SidewalkMaterial, UMaterialInterface* CrosswalkMaterial, UMaterialInterface* JunctionMaterial, UMaterialInterface* MedianMaterial,
+	UMaterialInterface* SolidMarkingMaterial, UMaterialInterface* LaneDashMarkingMaterial, UMaterialInterface* IntersectionDashMarkingMaterial, UMaterialInterface* CrosswalkDashMarkingMaterial,
+	UMaterialInterface* BikeLaneMaterial, UMaterialInterface* ParkingMarkingMaterial,
+	UMaterialInterface* ParkingLaneMaterial)
 {
 	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 
@@ -73,6 +76,41 @@ int32 FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(UMaterialInterface* Roa
 		if (MedianMaterial && Profile->MedianMaterial != MedianMaterial)
 		{
 			Profile->MedianMaterial = MedianMaterial;
+			bChanged = true;
+		}
+		if (SolidMarkingMaterial && Profile->SolidMarkingMaterial != SolidMarkingMaterial)
+		{
+			Profile->SolidMarkingMaterial = SolidMarkingMaterial;
+			bChanged = true;
+		}
+		if (LaneDashMarkingMaterial && Profile->LaneDashMarkingMaterial != LaneDashMarkingMaterial)
+		{
+			Profile->LaneDashMarkingMaterial = LaneDashMarkingMaterial;
+			bChanged = true;
+		}
+		if (IntersectionDashMarkingMaterial && Profile->IntersectionDashMarkingMaterial != IntersectionDashMarkingMaterial)
+		{
+			Profile->IntersectionDashMarkingMaterial = IntersectionDashMarkingMaterial;
+			bChanged = true;
+		}
+		if (CrosswalkDashMarkingMaterial && Profile->CrosswalkDashMarkingMaterial != CrosswalkDashMarkingMaterial)
+		{
+			Profile->CrosswalkDashMarkingMaterial = CrosswalkDashMarkingMaterial;
+			bChanged = true;
+		}
+		if (BikeLaneMaterial && Profile->BikeLaneMaterial != BikeLaneMaterial)
+		{
+			Profile->BikeLaneMaterial = BikeLaneMaterial;
+			bChanged = true;
+		}
+		if (ParkingMarkingMaterial && Profile->ParkingMarkingMaterial != ParkingMarkingMaterial)
+		{
+			Profile->ParkingMarkingMaterial = ParkingMarkingMaterial;
+			bChanged = true;
+		}
+		if (ParkingLaneMaterial && Profile->ParkingLaneMaterial != ParkingLaneMaterial)
+		{
+			Profile->ParkingLaneMaterial = ParkingLaneMaterial;
 			bChanged = true;
 		}
 

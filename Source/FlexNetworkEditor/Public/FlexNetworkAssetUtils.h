@@ -26,5 +26,8 @@ namespace FlexNetworkAssetUtils
 	 * generate dozens of auto-named profiles that would otherwise all need their materials set by
 	 * hand one at a time. Saves each modified profile to disk. Returns how many were changed.
 	 */
-	FLEXNETWORKEDITOR_API int32 ApplyMaterialsToAllProfiles(UMaterialInterface* RoadMaterial, UMaterialInterface* SidewalkMaterial, UMaterialInterface* CrosswalkMaterial, UMaterialInterface* JunctionMaterial, UMaterialInterface* MedianMaterial);
+	FLEXNETWORKEDITOR_API int32 ApplyMaterialsToAllProfiles(UMaterialInterface* RoadMaterial, UMaterialInterface* SidewalkMaterial, UMaterialInterface* CrosswalkMaterial, UMaterialInterface* JunctionMaterial, UMaterialInterface* MedianMaterial,
+		UMaterialInterface* SolidMarkingMaterial = nullptr, UMaterialInterface* LaneDashMarkingMaterial = nullptr, UMaterialInterface* IntersectionDashMarkingMaterial = nullptr, UMaterialInterface* CrosswalkDashMarkingMaterial = nullptr,
+		UMaterialInterface* BikeLaneMaterial = nullptr, UMaterialInterface* ParkingMarkingMaterial = nullptr,
+		UMaterialInterface* ParkingLaneMaterial = nullptr);
 }

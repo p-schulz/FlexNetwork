@@ -9,6 +9,7 @@
 #include "Math/FlexGeometry2D.h"
 #include "Mesh/FlexRoadMeshBuilder.h"
 #include "Mesh/FlexRailMeshBuilder.h"
+#include "Mesh/FlexRoadMarkingBuilder.h"
 #include "Mesh/FlexUnifiedRoadMeshBuilder.h"
 #include "Rail/FlexTrackGraphBuilder.h"
 #include "Rail/FlexTrackJunctionSolver.h"
@@ -777,6 +778,10 @@ bool UFlexNetworkSubsystem::RemoveSegment(FFlexSegmentId SegmentId)
 	Segments.Remove(SegmentId);
 	SegmentIdAllocator.Free(SegmentId);
 	DirtySegments.Remove(SegmentId);
+	// The removed segment can never again appear in a dirty-segment scope check (it's gone), so a
+	// rail/marking-relevance check keyed purely on "which currently-dirty segments are rail" could
+	// never notice the removal -- force the next rebuild's rail/marking recompute to be unscoped.
+	bSegmentRemovedSinceLastRebuild = true;
 	if (bRemovedRail)
 	{
 		// Actor-driven PCG assigns the profile-wide rail boolean to the lowest live rail ID.
@@ -1528,8 +1533,8 @@ bool UFlexNetworkSubsystem::BuildSegmentMeshResult(FFlexSegmentId SegmentId, FFl
 	const FFlexRoadNode* StartNode = Nodes.Find(Segment->StartNodeId);
 	OutResult = FFlexRoadMeshBuilder::BuildSegmentMesh(Segment->Curve, Segment->ArcLengthTable,
 		Segment->Profile, StartNode ? StartNode->UpVector : FVector::UpVector,
-		GetSettings()->ArcLengthSampleStep, TrimStart, TrimEnd);
-	return !OutResult.Roadway.IsEmpty() || !OutResult.Sidewalks.IsEmpty();
+		GetSettings()->ArcLengthSampleStep, TrimStart, TrimEnd, GetSettings()->BikeLaneVerticalOffset, GetSettings()->ParkingLaneVerticalOffset);
+	return !OutResult.Roadway.IsEmpty() || !OutResult.Sidewalks.IsEmpty() || !OutResult.BikeLanes.IsEmpty() || !OutResult.Median.IsEmpty() || !OutResult.ParkingLanes.IsEmpty();
 }
 
 bool UFlexNetworkSubsystem::GetSegmentTrimRange(FFlexSegmentId SegmentId, float& OutTrimStart, float& OutTrimEnd) const
@@ -1681,11 +1686,638 @@ void UFlexNetworkSubsystem::BuildRailMeshResults(TArray<FFlexMeshSectionData>& O
 	}
 }
 
-FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResult() const
+void UFlexNetworkSubsystem::BuildRoadMarkingMeshResults(TArray<FFlexMeshSectionData>& OutResults) const
 {
-	TArray<FFlexUnifiedRoadPolygonInput> SurfaceInputs;
-	TArray<FFlexUnifiedRoadSuppressionInput> SuppressionInputs;
+	OutResults.Reset();
 	const UFlexNetworkSettings* Settings = GetSettings();
+	if (!Settings->bGenerateRoadMarkings)
+	{
+		return;
+	}
+
+	FFlexRoadMarkingParams Params;
+	Params.SolidLineWidth = Settings->MarkingSolidLineWidth;
+	Params.LaneDashWidth = Settings->MarkingLaneDashWidth;
+	Params.LaneDashLength = Settings->MarkingLaneDashLength;
+	Params.LaneDashGap = Settings->MarkingLaneDashGapLength;
+	Params.IntersectionDashWidth = Settings->MarkingIntersectionDashWidth;
+	Params.IntersectionDashLength = Settings->MarkingIntersectionDashLength;
+	Params.IntersectionDashGap = Settings->MarkingIntersectionDashGapLength;
+	Params.CrosswalkDashWidth = Settings->MarkingCrosswalkDashWidth;
+	Params.CrosswalkDashLength = Settings->MarkingCrosswalkDashLength;
+	Params.CrosswalkDashGap = Settings->MarkingCrosswalkDashGapLength;
+	Params.SolidToDashedTransitionDistance = Settings->MarkingSolidToDashedTransitionDistance;
+	Params.StopLineThickness = Settings->MarkingStopLineThickness;
+	Params.StopLineSetback = Settings->MarkingStopLineSetback;
+	Params.VerticalOffset = Settings->MarkingVerticalOffset;
+	Params.ParkingLineWidth = Settings->MarkingParkingLineWidth;
+	Params.ParkingSpotSpacing = Settings->MarkingParkingSpotSpacing;
+
+	// One accumulated section per distinct material actually used, per category -- most projects
+	// share one marking material across many profiles, so this merges into far fewer draw calls
+	// than one section per profile while still splitting correctly when profiles genuinely differ.
+	TMap<UMaterialInterface*, FFlexMeshSectionData> SolidByMaterial;
+	TMap<UMaterialInterface*, FFlexMeshSectionData> LaneDashByMaterial;
+	TMap<UMaterialInterface*, FFlexMeshSectionData> IntersectionDashByMaterial;
+	TMap<UMaterialInterface*, FFlexMeshSectionData> CrosswalkDashByMaterial;
+	TMap<UMaterialInterface*, FFlexMeshSectionData> StopLineByMaterial;
+	TMap<UMaterialInterface*, FFlexMeshSectionData> ParkingByMaterial;
+
+	auto GetOrCreateSection = [](TMap<UMaterialInterface*, FFlexMeshSectionData>& Map, UMaterialInterface* Material) -> FFlexMeshSectionData*
+	{
+		if (!Material)
+		{
+			return nullptr;
+		}
+		FFlexMeshSectionData* Section = Map.Find(Material);
+		if (!Section)
+		{
+			Section = &Map.Add(Material);
+			Section->Material = Material;
+		}
+		return Section;
+	};
+
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexSegmentId SegmentId = Pair.Key;
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || Segment.Profile->bIsRailProfile || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		if (IsInternalComplexIntersectionSegment(Segment))
+		{
+			continue;
+		}
+
+		FFlexMeshSectionData* SolidSection = GetOrCreateSection(SolidByMaterial, Segment.Profile->SolidMarkingMaterial);
+		FFlexMeshSectionData* LaneDashSection = GetOrCreateSection(LaneDashByMaterial, Segment.Profile->LaneDashMarkingMaterial);
+		FFlexMeshSectionData* ParkingSection = GetOrCreateSection(ParkingByMaterial, Segment.Profile->ParkingMarkingMaterial);
+		if (!SolidSection && !LaneDashSection && !ParkingSection)
+		{
+			continue;
+		}
+
+		const float SegmentLength = Segment.GetLength();
+		const FFlexJunctionData* StartJunction = JunctionDataByNode.Find(Segment.StartNodeId);
+		const FFlexJunctionData* EndJunction = JunctionDataByNode.Find(Segment.EndNodeId);
+
+		float TrimStart = 0.f;
+		float TrimEnd = SegmentLength;
+		if (StartJunction)
+		{
+			if (const float* Trim = StartJunction->TrimArcLengthBySegment.Find(SegmentId))
+			{
+				TrimStart = FMath::Clamp(*Trim, 0.f, SegmentLength);
+			}
+		}
+		if (EndJunction)
+		{
+			if (const float* Trim = EndJunction->TrimArcLengthBySegment.Find(SegmentId))
+			{
+				TrimEnd = FMath::Clamp(*Trim, 0.f, SegmentLength);
+			}
+		}
+		if (TrimEnd - TrimStart <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		// Crosswalks are frequently placed inside this segment's own trimmed span (a junction's
+		// CrosswalkMinClearance can exceed its actual trim distance), so lane markings must be kept
+		// out of their footprint explicitly rather than relying on the trim boundary alone.
+		TArray<FVector2D> CrosswalkExclusionRanges;
+		const float ExclusionPadding = Settings->MarkingCrosswalkExclusionPadding;
+		for (const FFlexJunctionData* Junction : { StartJunction, EndJunction })
+		{
+			if (!Junction)
+			{
+				continue;
+			}
+			for (const FFlexCrosswalkPlacement& Crosswalk : Junction->Crosswalks)
+			{
+				if (Crosswalk.SegmentId != SegmentId || Crosswalk.Length <= KINDA_SMALL_NUMBER)
+				{
+					continue;
+				}
+				const float CenterArcLength = FFlexBezierMath::FindNearestArcLength(Segment.Curve, Segment.ArcLengthTable, Crosswalk.Center);
+				const float HalfSpan = Crosswalk.Length * 0.5f + ExclusionPadding;
+				CrosswalkExclusionRanges.Add(FVector2D(CenterArcLength - HalfSpan, CenterArcLength + HalfSpan));
+			}
+		}
+
+		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
+		FFlexRoadMarkingBuilder::BuildSegmentLaneMarkings(Segment.Curve, Segment.ArcLengthTable, Segment.Profile,
+			ReferenceUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd, StartJunction != nullptr, EndJunction != nullptr,
+			CrosswalkExclusionRanges, Params, SolidSection, LaneDashSection);
+
+		if (ParkingSection)
+		{
+			for (const FRoadLaneDescriptor& Lane : Segment.Profile->Lanes)
+			{
+				if (Lane.Type != EFlexLaneType::Parking)
+				{
+					continue;
+				}
+				FFlexRoadMarkingBuilder::BuildParkingSpotMarkings(Segment.Curve, Segment.ArcLengthTable, Lane,
+					Segment.Profile->GetLaneLateralOffset(Lane), ReferenceUp, TrimStart, TrimEnd, Params, ParkingSection);
+			}
+		}
+	}
+
+	// German-urban-intersection convention (see bMarkingIntersectionLeftmostLaneOnly): a lane counts
+	// as "incoming" at a node the same way FFlexIntersectionBuilder's own (private) GetLaneRoles
+	// does -- replicated here rather than shared, since that helper isn't part of the public API.
+	auto IsLaneIncomingAtNode = [](const FRoadLaneDescriptor& Lane, bool bNodeIsSegmentEnd)
+	{
+		switch (Lane.Direction)
+		{
+		case EFlexLaneDirection::Forward: return bNodeIsSegmentEnd;
+		case EFlexLaneDirection::Backward: return !bNodeIsSegmentEnd;
+		case EFlexLaneDirection::Bidirectional: return true;
+		default: return false;
+		}
+	};
+	// "Leftmost" (closest to oncoming traffic/the centerline) is the most-negative-offset incoming
+	// lane for a node this segment's Forward direction reaches, and the most-positive-offset one for
+	// a node it reaches travelling Backward -- the segment's own Right axis effectively flips sign
+	// with the direction of travel.
+	auto IsLeftmostIncomingLane = [&IsLaneIncomingAtNode](const URoadTypeProfile& Profile, int32 LaneIndex, bool bNodeIsSegmentEnd)
+	{
+		if (!Profile.Lanes.IsValidIndex(LaneIndex))
+		{
+			return false;
+		}
+		const float CandidateOffset = Profile.GetLaneLateralOffset(Profile.Lanes[LaneIndex]);
+		for (const FRoadLaneDescriptor& OtherLane : Profile.Lanes)
+		{
+			if ((OtherLane.Type != EFlexLaneType::Vehicle && OtherLane.Type != EFlexLaneType::Bike) || !IsLaneIncomingAtNode(OtherLane, bNodeIsSegmentEnd))
+			{
+				continue;
+			}
+			const float OtherOffset = Profile.GetLaneLateralOffset(OtherLane);
+			const bool bOtherIsMoreLeft = bNodeIsSegmentEnd
+				? (OtherOffset < CandidateOffset - KINDA_SMALL_NUMBER)
+				: (OtherOffset > CandidateOffset + KINDA_SMALL_NUMBER);
+			if (bOtherIsMoreLeft)
+			{
+				return false;
+			}
+		}
+		return true;
+	};
+	// -1 = right turn, 0 = straight, 1 = left turn. TurnAngleDegrees alone can't tell left from
+	// right (it's unsigned), so this reconstructs the sign from the connector curve's own endpoint
+	// tangents -- a counterclockwise sweep (as seen from Up, i.e. from above) is a left turn.
+	auto ClassifyTurnDirection = [](const FFlexLaneConnector& Connector, const FVector& Up, float StraightToleranceDegrees) -> int32
+	{
+		if (Connector.TurnAngleDegrees <= StraightToleranceDegrees)
+		{
+			return 0;
+		}
+		const FVector StartTangent = FFlexBezierMath::EvaluateDerivative(Connector.ConnectorCurve, 0.f).GetSafeNormal();
+		const FVector EndTangent = FFlexBezierMath::EvaluateDerivative(Connector.ConnectorCurve, 1.f).GetSafeNormal();
+		const float SignedCross = FVector::DotProduct(FVector::CrossProduct(StartTangent, EndTangent), Up);
+		return SignedCross >= 0.f ? 1 : -1;
+	};
+
+	for (const TPair<FFlexNodeId, FFlexJunctionData>& Pair : JunctionDataByNode)
+	{
+		const FFlexJunctionData& Junction = Pair.Value;
+		const FFlexRoadNode* Node = Nodes.Find(Pair.Key);
+		const FVector ReferenceUp = Node ? Node->UpVector : FVector::UpVector;
+
+		for (const FFlexCrosswalkPlacement& Crosswalk : Junction.Crosswalks)
+		{
+			const FFlexRoadSegment* CrossedSegment = Segments.Find(Crosswalk.SegmentId);
+			if (!CrossedSegment || !CrossedSegment->Profile || !CrossedSegment->ArcLengthTable.IsValid())
+			{
+				continue;
+			}
+			if (FFlexMeshSectionData* CrosswalkDashSection = GetOrCreateSection(CrosswalkDashByMaterial, CrossedSegment->Profile->CrosswalkDashMarkingMaterial))
+			{
+				FFlexRoadMarkingBuilder::BuildCrosswalkMarkings(Crosswalk, ReferenceUp, Params, CrosswalkDashSection);
+			}
+
+			// Stop line: only for the lane(s) that have this crosswalk ahead of them in their own
+			// direction of travel (right-hand traffic) -- i.e. the lanes classified as incoming at
+			// this junction node, the same classification used for the intersection guide dashes.
+			if (FFlexMeshSectionData* StopLineSection = GetOrCreateSection(StopLineByMaterial, CrossedSegment->Profile->StopLineMarkingMaterial))
+			{
+				const bool bNodeIsSegmentEnd = CrossedSegment->EndNodeId == Pair.Key;
+				float SpanMin = MAX_flt;
+				float SpanMax = -MAX_flt;
+				for (const FRoadLaneDescriptor& Lane : CrossedSegment->Profile->Lanes)
+				{
+					if ((Lane.Type != EFlexLaneType::Vehicle && Lane.Type != EFlexLaneType::Bike) || !IsLaneIncomingAtNode(Lane, bNodeIsSegmentEnd))
+					{
+						continue;
+					}
+					const float LaneOffset = CrossedSegment->Profile->GetLaneLateralOffset(Lane);
+					SpanMin = FMath::Min(SpanMin, LaneOffset - Lane.Width * 0.5f);
+					SpanMax = FMath::Max(SpanMax, LaneOffset + Lane.Width * 0.5f);
+				}
+
+				if (SpanMax > SpanMin)
+				{
+					const float SegmentLength = CrossedSegment->GetLength();
+					const float CrosswalkArcLength = FFlexBezierMath::FindNearestArcLength(CrossedSegment->Curve, CrossedSegment->ArcLengthTable, Crosswalk.Center);
+					const float SetbackDistance = Crosswalk.Length * 0.5f + Params.StopLineSetback;
+					// "Before" the crosswalk, relative to the incoming lane's own direction of travel:
+					// a smaller arc length if that traffic travels toward increasing arc length
+					// (bNodeIsSegmentEnd, i.e. the junction sits at this segment's end), a larger one
+					// if it travels toward decreasing arc length (junction at the segment's start).
+					const float StopLineArcLength = FMath::Clamp(
+						bNodeIsSegmentEnd ? (CrosswalkArcLength - SetbackDistance) : (CrosswalkArcLength + SetbackDistance),
+						0.f, SegmentLength);
+					const FFlexCurveFrame StopLineFrame = FFlexRoadMeshBuilder::SampleFrameAtArcLength(
+						CrossedSegment->Curve, CrossedSegment->ArcLengthTable, StopLineArcLength, ReferenceUp);
+					FFlexRoadMarkingBuilder::BuildStopLineMarking(StopLineFrame, SpanMin, SpanMax, Params, StopLineSection);
+				}
+			}
+		}
+
+		// A bidirectional lane between two approaches produces two FFlexLaneConnector entries -- one
+		// each direction (see FFlexIntersectionBuilder::BuildJunction's Incoming x Outgoing pairing)
+		// -- so pathfinding sees connectivity both ways. That's correct for lane connectors, but it's
+		// the *same physical lane*, so it must only get one marking, not one flanking each side.
+		TSet<FString> MarkedConnectorPairs;
+		auto MakeLaneEndpointKey = [](FFlexSegmentId Segment, int32 LaneIndex)
+		{
+			return FString::Printf(TEXT("%u.%u:%d"), Segment.Index, Segment.Generation, LaneIndex);
+		};
+
+		for (const FFlexLaneConnector& Connector : Junction.LaneConnectors)
+		{
+			const FFlexRoadSegment* FromSegment = Segments.Find(Connector.FromSegment);
+			if (!FromSegment || !FromSegment->Profile || !FromSegment->Profile->Lanes.IsValidIndex(Connector.FromLaneIndex))
+			{
+				continue;
+			}
+			const FRoadLaneDescriptor& FromLane = FromSegment->Profile->Lanes[Connector.FromLaneIndex];
+			if (FromLane.Type != EFlexLaneType::Vehicle && FromLane.Type != EFlexLaneType::Bike)
+			{
+				continue;
+			}
+
+			if (Settings->bMarkingIntersectionLeftmostLaneOnly)
+			{
+				const bool bNodeIsSegmentEnd = FromSegment->EndNodeId == Pair.Key;
+				if (!IsLeftmostIncomingLane(*FromSegment->Profile, Connector.FromLaneIndex, bNodeIsSegmentEnd))
+				{
+					continue;
+				}
+				if (ClassifyTurnDirection(Connector, ReferenceUp, Settings->MarkingIntersectionStraightAngleToleranceDegrees) < 0)
+				{
+					continue; // Right turn -- conventionally unmarked, even from the leftmost lane.
+				}
+			}
+
+			FFlexMeshSectionData* IntersectionDashSection = GetOrCreateSection(IntersectionDashByMaterial, FromSegment->Profile->IntersectionDashMarkingMaterial);
+			if (!IntersectionDashSection)
+			{
+				continue;
+			}
+
+			// Only consume the pair once a marking will actually be generated for it -- if this
+			// direction's profile has no material set, leave the key free so the reverse-direction
+			// connector (which might belong to a differently-configured profile) still gets a chance.
+			const FString FromKey = MakeLaneEndpointKey(Connector.FromSegment, Connector.FromLaneIndex);
+			const FString ToKey = MakeLaneEndpointKey(Connector.ToSegment, Connector.ToLaneIndex);
+			const FString PairKey = FromKey < ToKey ? (FromKey + TEXT("|") + ToKey) : (ToKey + TEXT("|") + FromKey);
+			if (MarkedConnectorPairs.Contains(PairKey))
+			{
+				continue;
+			}
+			MarkedConnectorPairs.Add(PairKey);
+
+			FFlexRoadMarkingBuilder::BuildIntersectionLaneMarking(Connector, FromLane.Width, ReferenceUp, Params, IntersectionDashSection);
+		}
+	}
+
+	auto AppendNonEmptySections = [&OutResults](TMap<UMaterialInterface*, FFlexMeshSectionData>& Map)
+	{
+		for (TPair<UMaterialInterface*, FFlexMeshSectionData>& Entry : Map)
+		{
+			if (!Entry.Value.IsEmpty())
+			{
+				OutResults.Add(MoveTemp(Entry.Value));
+			}
+		}
+	};
+	AppendNonEmptySections(SolidByMaterial);
+	AppendNonEmptySections(LaneDashByMaterial);
+	AppendNonEmptySections(IntersectionDashByMaterial);
+	AppendNonEmptySections(CrosswalkDashByMaterial);
+	AppendNonEmptySections(StopLineByMaterial);
+	AppendNonEmptySections(ParkingByMaterial);
+}
+
+void UFlexNetworkSubsystem::BuildBikeLaneMeshResults(TArray<FFlexMeshSectionData>& OutResults) const
+{
+	OutResults.Reset();
+	const UFlexNetworkSettings* Settings = GetSettings();
+
+	// One accumulated section per distinct BikeLaneMaterial actually used, same reasoning as
+	// BuildRoadMarkingMeshResults' per-material grouping.
+	TMap<UMaterialInterface*, FFlexMeshSectionData> BikeLaneByMaterial;
+
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || Segment.Profile->bIsRailProfile || !Segment.Profile->BikeLaneMaterial || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		if (IsInternalComplexIntersectionSegment(Segment))
+		{
+			continue;
+		}
+
+		float TrimStart = 0.f;
+		float TrimEnd = Segment.GetLength();
+		if (!GetSegmentTrimRange(Pair.Key, TrimStart, TrimEnd))
+		{
+			continue;
+		}
+		if (TrimEnd - TrimStart <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		FFlexMeshSectionData* Section = BikeLaneByMaterial.Find(Segment.Profile->BikeLaneMaterial.Get());
+		if (!Section)
+		{
+			Section = &BikeLaneByMaterial.Add(Segment.Profile->BikeLaneMaterial.Get());
+			Section->Material = Segment.Profile->BikeLaneMaterial;
+		}
+
+		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
+		const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(
+			Segment.Curve, Segment.ArcLengthTable, ReferenceUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
+		FFlexRoadMeshBuilder::AppendBikeLaneOverlay(*Section, Frames, *Segment.Profile, Settings->BikeLaneVerticalOffset);
+	}
+
+	for (TPair<UMaterialInterface*, FFlexMeshSectionData>& Entry : BikeLaneByMaterial)
+	{
+		if (!Entry.Value.IsEmpty())
+		{
+			OutResults.Add(MoveTemp(Entry.Value));
+		}
+	}
+}
+
+void UFlexNetworkSubsystem::BuildParkingLaneMeshResults(TArray<FFlexMeshSectionData>& OutResults) const
+{
+	OutResults.Reset();
+	const UFlexNetworkSettings* Settings = GetSettings();
+
+	TMap<UMaterialInterface*, FFlexMeshSectionData> ParkingLaneByMaterial;
+
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || Segment.Profile->bIsRailProfile || !Segment.Profile->ParkingLaneMaterial || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		if (IsInternalComplexIntersectionSegment(Segment))
+		{
+			continue;
+		}
+
+		float TrimStart = 0.f;
+		float TrimEnd = Segment.GetLength();
+		if (!GetSegmentTrimRange(Pair.Key, TrimStart, TrimEnd))
+		{
+			continue;
+		}
+		if (TrimEnd - TrimStart <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		FFlexMeshSectionData* Section = ParkingLaneByMaterial.Find(Segment.Profile->ParkingLaneMaterial.Get());
+		if (!Section)
+		{
+			Section = &ParkingLaneByMaterial.Add(Segment.Profile->ParkingLaneMaterial.Get());
+			Section->Material = Segment.Profile->ParkingLaneMaterial;
+		}
+
+		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
+		const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(
+			Segment.Curve, Segment.ArcLengthTable, ReferenceUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
+		FFlexRoadMeshBuilder::AppendParkingLaneOverlay(*Section, Frames, *Segment.Profile, Settings->ParkingLaneVerticalOffset);
+	}
+
+	for (TPair<UMaterialInterface*, FFlexMeshSectionData>& Entry : ParkingLaneByMaterial)
+	{
+		if (!Entry.Value.IsEmpty())
+		{
+			OutResults.Add(MoveTemp(Entry.Value));
+		}
+	}
+}
+
+void UFlexNetworkSubsystem::BuildMedianMeshResults(TArray<FFlexMeshSectionData>& OutTopResults, TArray<FFlexMeshSectionData>& OutWallResults) const
+{
+	OutTopResults.Reset();
+	OutWallResults.Reset();
+	const UFlexNetworkSettings* Settings = GetSettings();
+
+	TMap<UMaterialInterface*, FFlexMeshSectionData> TopByMaterial;
+	TMap<UMaterialInterface*, FFlexMeshSectionData> WallByMaterial;
+
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || Segment.Profile->bIsRailProfile || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		UMaterialInterface* WallMaterial = Segment.Profile->CurbMaterial ? Segment.Profile->CurbMaterial.Get() : Segment.Profile->SidewalkMaterial.Get();
+		if (!Segment.Profile->MedianMaterial && !WallMaterial)
+		{
+			continue;
+		}
+		if (IsInternalComplexIntersectionSegment(Segment))
+		{
+			continue;
+		}
+
+		float TrimStart = 0.f;
+		float TrimEnd = Segment.GetLength();
+		if (!GetSegmentTrimRange(Pair.Key, TrimStart, TrimEnd))
+		{
+			continue;
+		}
+		if (TrimEnd - TrimStart <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		FFlexMeshSectionData* TopSection = TopByMaterial.Find(Segment.Profile->MedianMaterial.Get());
+		if (!TopSection)
+		{
+			TopSection = &TopByMaterial.Add(Segment.Profile->MedianMaterial.Get());
+			TopSection->Material = Segment.Profile->MedianMaterial;
+		}
+		FFlexMeshSectionData* WallSection = WallByMaterial.Find(WallMaterial);
+		if (!WallSection)
+		{
+			WallSection = &WallByMaterial.Add(WallMaterial);
+			WallSection->Material = WallMaterial;
+		}
+
+		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
+		const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(
+			Segment.Curve, Segment.ArcLengthTable, ReferenceUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
+		FFlexRoadMeshBuilder::AppendMedianOverlay(*TopSection, *WallSection, Frames, *Segment.Profile, Segment.Profile->MedianHeight);
+	}
+
+	for (TPair<UMaterialInterface*, FFlexMeshSectionData>& Entry : TopByMaterial)
+	{
+		if (!Entry.Value.IsEmpty())
+		{
+			OutTopResults.Add(MoveTemp(Entry.Value));
+		}
+	}
+	for (TPair<UMaterialInterface*, FFlexMeshSectionData>& Entry : WallByMaterial)
+	{
+		if (!Entry.Value.IsEmpty())
+		{
+			OutWallResults.Add(MoveTemp(Entry.Value));
+		}
+	}
+}
+
+namespace
+{
+	/** Minimal union-find over FFlexNodeId, used by BuildUnifiedClassicMeshResult to compute the road graph's connected components for per-component mesh caching. */
+	struct FNodeUnionFind
+	{
+		TMap<FFlexNodeId, FFlexNodeId> Parent;
+
+		void MakeSet(FFlexNodeId Id) { Parent.FindOrAdd(Id, Id); }
+
+		FFlexNodeId Find(FFlexNodeId Id)
+		{
+			FFlexNodeId Root = Id;
+			for (;;)
+			{
+				const FFlexNodeId* P = Parent.Find(Root);
+				if (!P || *P == Root)
+				{
+					break;
+				}
+				Root = *P;
+			}
+			FFlexNodeId Cur = Id;
+			for (;;)
+			{
+				FFlexNodeId* P = Parent.Find(Cur);
+				if (!P || *P == Root)
+				{
+					break;
+				}
+				const FFlexNodeId Next = *P;
+				*P = Root;
+				Cur = Next;
+			}
+			return Root;
+		}
+
+		void Union(FFlexNodeId A, FFlexNodeId B)
+		{
+			const FFlexNodeId RootA = Find(A);
+			const FFlexNodeId RootB = Find(B);
+			if (RootA != RootB)
+			{
+				Parent.FindOrAdd(RootA) = RootB;
+			}
+		}
+	};
+
+	/** Deterministic ordering independent of union-find internals, used to pick a stable per-component cache key (the smallest member node ID) that survives unchanged across rebuilds as long as component membership itself doesn't change. */
+	bool IsSmallerNodeId(FFlexNodeId A, FFlexNodeId B)
+	{
+		return A.Index != B.Index ? A.Index < B.Index : A.Generation < B.Generation;
+	}
+}
+
+FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResult(const TSet<FFlexSegmentId>* DirtySegmentsScope)
+{
+	const UFlexNetworkSettings* Settings = GetSettings();
+
+	// ---- Connected components of the road graph (every segment, rail included -- a rail-only
+	// bridge between two otherwise-separate road networks is a rare enough case that treating it
+	// conservatively as "one component" costs little and avoids having to reason about whether rail
+	// edges can ever matter to road-footprint adjacency). Two segments can only geometrically touch
+	// or overlap in the unified boolean union if they share a junction node, so partitioning by graph
+	// connectivity and unioning each component separately produces an identical result to one global
+	// union -- just cheaper to skip re-doing for components nothing in DirtySegmentsScope touched.
+	FNodeUnionFind ComponentUnionFind;
+	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Nodes)
+	{
+		ComponentUnionFind.MakeSet(Pair.Key);
+	}
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		ComponentUnionFind.Union(Pair.Value.StartNodeId, Pair.Value.EndNodeId);
+	}
+
+	TMap<FFlexNodeId, TArray<FFlexNodeId>> MembersByRoot;
+	for (const TPair<FFlexNodeId, FFlexRoadNode>& Pair : Nodes)
+	{
+		MembersByRoot.FindOrAdd(ComponentUnionFind.Find(Pair.Key)).Add(Pair.Key);
+	}
+
+	// Canonical component key = smallest member node ID, not the union-find root (which root ends
+	// up representing a component is an incidental implementation detail of iteration/union order,
+	// not stable across rebuilds even when membership is identical).
+	TMap<FFlexNodeId, FFlexNodeId> ComponentKeyByNode;
+	TSet<FFlexNodeId> AllComponentKeys;
+	for (const TPair<FFlexNodeId, TArray<FFlexNodeId>>& Entry : MembersByRoot)
+	{
+		FFlexNodeId Key = Entry.Value[0];
+		for (FFlexNodeId Member : Entry.Value)
+		{
+			if (IsSmallerNodeId(Member, Key))
+			{
+				Key = Member;
+			}
+		}
+		AllComponentKeys.Add(Key);
+		for (FFlexNodeId Member : Entry.Value)
+		{
+			ComponentKeyByNode.Add(Member, Key);
+		}
+	}
+	auto ComponentKeyOf = [&ComponentKeyByNode](FFlexNodeId NodeId) -> FFlexNodeId
+	{
+		const FFlexNodeId* Key = ComponentKeyByNode.Find(NodeId);
+		return Key ? *Key : NodeId;
+	};
+
+	// Which components does this rebuild's dirty scope actually touch? A null scope (full/unknown
+	// rebuild, e.g. RebuildAllNetworkGeometry or a removal since the last call -- see
+	// bSegmentRemovedSinceLastRebuild) means "every component is dirty."
+	TSet<FFlexNodeId> DirtyComponentKeys;
+	if (DirtySegmentsScope)
+	{
+		for (FFlexSegmentId SegId : *DirtySegmentsScope)
+		{
+			if (const FFlexRoadSegment* Segment = Segments.Find(SegId))
+			{
+				DirtyComponentKeys.Add(ComponentKeyOf(Segment->StartNodeId));
+				DirtyComponentKeys.Add(ComponentKeyOf(Segment->EndNodeId));
+			}
+		}
+	}
+
+	TMap<FFlexNodeId, TArray<FFlexUnifiedRoadPolygonInput>> SurfaceInputsByComponent;
+	TMap<FFlexNodeId, TArray<FFlexUnifiedRoadSuppressionInput>> SuppressionInputsByComponent;
 
 	// Start with the current angle-trimmed segment strips. A short segment whose two junction
 	// trims leave too little usable roadside is deliberately bridged at full length; its expanded
@@ -1754,9 +2386,10 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 		Surface.RoadMaterial = Segment.Profile->RoadMaterial;
 		Surface.SidewalkMaterial = Segment.Profile->SidewalkMaterial;
 		Surface.CurbMaterial = Segment.Profile->CurbMaterial ? Segment.Profile->CurbMaterial.Get() : Segment.Profile->SidewalkMaterial.Get();
+		const FFlexNodeId SegmentComponentKey = ComponentKeyOf(Segment.StartNodeId);
 		if (Surface.Boundary.Num() >= 3)
 		{
-			SurfaceInputs.Add(MoveTemp(Surface));
+			SurfaceInputsByComponent.FindOrAdd(SegmentComponentKey).Add(MoveTemp(Surface));
 		}
 
 		if (bCloseJunctionBridge)
@@ -1772,7 +2405,7 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 			Suppression.ElevationLayer = static_cast<int32>(Segment.ElevationType);
 			if (Suppression.Boundary.Num() >= 3)
 			{
-				SuppressionInputs.Add(MoveTemp(Suppression));
+				SuppressionInputsByComponent.FindOrAdd(SegmentComponentKey).Add(MoveTemp(Suppression));
 			}
 		}
 	}
@@ -1791,7 +2424,7 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 		FFlexUnifiedRoadPolygonInput RegionSurface;
 		if (BuildComplexIntersectionRegionSurface(RegionIndex, RegionSurface))
 		{
-			SurfaceInputs.Add(MoveTemp(RegionSurface));
+			SurfaceInputsByComponent.FindOrAdd(ComponentKeyOf(Pair.Key)).Add(MoveTemp(RegionSurface));
 			AddedComplexRegions.Add(RegionIndex);
 		}
 	}
@@ -1843,7 +2476,8 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 		Surface.CurbMaterial = MaterialSegment->Profile->CurbMaterial
 			? MaterialSegment->Profile->CurbMaterial.Get()
 			: MaterialSegment->Profile->SidewalkMaterial.Get();
-		SurfaceInputs.Add(MoveTemp(Surface));
+		const FFlexNodeId JunctionComponentKey = ComponentKeyOf(Pair.Key);
+		SurfaceInputsByComponent.FindOrAdd(JunctionComponentKey).Add(MoveTemp(Surface));
 
 		// A crosswalk is also a curb cut. Reserve a slightly expanded rectangle at each crossing so
 		// neither the procedural curb face nor the optional spline curbstones bridge across it. This
@@ -1885,15 +2519,140 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 			CrosswalkSuppression.ElevationLayer = static_cast<int32>(MaterialSegment->ElevationType);
 			CrosswalkSuppression.bSuppressSidewalks = false;
 			CrosswalkSuppression.bSuppressCurbs = true;
-			SuppressionInputs.Add(MoveTemp(CrosswalkSuppression));
+			SuppressionInputsByComponent.FindOrAdd(JunctionComponentKey).Add(MoveTemp(CrosswalkSuppression));
 		}
 	}
 
-	FFlexUnifiedNetworkMeshResult Result = FFlexUnifiedRoadMeshBuilder::Build(
-		SurfaceInputs, SuppressionInputs, Settings->MinimumGeneratedPolygonArea);
-	TArray<FFlexMeshSectionData> RailSections;
-	BuildRailMeshResults(RailSections);
-	Result.Roadways.Append(MoveTemp(RailSections));
+	// ---- Build (or reuse) each component's slice, then concatenate. ----
+	TMap<FFlexNodeId, FFlexCachedRoadComponent> NewCachedRoadComponents;
+	FFlexUnifiedNetworkMeshResult Result;
+	for (const FFlexNodeId ComponentKey : AllComponentKeys)
+	{
+		const TArray<FFlexUnifiedRoadPolygonInput>* ComponentSurfaceInputs = SurfaceInputsByComponent.Find(ComponentKey);
+		const TArray<FFlexUnifiedRoadSuppressionInput>* ComponentSuppressionInputs = SuppressionInputsByComponent.Find(ComponentKey);
+		if (!ComponentSurfaceInputs && !ComponentSuppressionInputs)
+		{
+			continue; // An all-rail (or otherwise surface-less) component contributes nothing here.
+		}
+
+		// ComponentKey is itself a member node ID (the smallest one), so its own union-find root
+		// resolves directly to this component's full member list.
+		const TArray<FFlexNodeId>& CurrentMembers = MembersByRoot.FindChecked(ComponentUnionFind.Find(ComponentKey));
+		TSet<FFlexNodeId> CurrentMemberSet;
+		CurrentMemberSet.Append(CurrentMembers);
+
+		const FFlexCachedRoadComponent* Cached = CachedRoadComponents.Find(ComponentKey);
+		const bool bComponentDirty = !DirtySegmentsScope || DirtyComponentKeys.Contains(ComponentKey);
+		bool bMembershipMatches = Cached && Cached->MemberNodeIds.Num() == CurrentMemberSet.Num();
+		if (bMembershipMatches)
+		{
+			for (const FFlexNodeId Member : CurrentMemberSet)
+			{
+				if (!Cached->MemberNodeIds.Contains(Member))
+				{
+					bMembershipMatches = false;
+					break;
+				}
+			}
+		}
+
+		FFlexCachedRoadComponent& NewEntry = NewCachedRoadComponents.FindOrAdd(ComponentKey);
+		NewEntry.MemberNodeIds = CurrentMemberSet;
+
+		if (Cached && bMembershipMatches && !bComponentDirty)
+		{
+			NewEntry.Roadways = Cached->Roadways;
+			NewEntry.Sidewalks = Cached->Sidewalks;
+			NewEntry.Curbs = Cached->Curbs;
+			NewEntry.CurbLines = Cached->CurbLines;
+		}
+		else
+		{
+			static const TArray<FFlexUnifiedRoadPolygonInput> EmptySurfaceInputs;
+			static const TArray<FFlexUnifiedRoadSuppressionInput> EmptySuppressionInputs;
+			const FFlexUnifiedNetworkMeshResult ComponentResult = FFlexUnifiedRoadMeshBuilder::Build(
+				ComponentSurfaceInputs ? *ComponentSurfaceInputs : EmptySurfaceInputs,
+				ComponentSuppressionInputs ? *ComponentSuppressionInputs : EmptySuppressionInputs,
+				Settings->MinimumGeneratedPolygonArea);
+			NewEntry.Roadways = ComponentResult.Roadways;
+			NewEntry.Sidewalks = ComponentResult.Sidewalks;
+			NewEntry.Curbs = ComponentResult.Curbs;
+			NewEntry.CurbLines = ComponentResult.CurbLines;
+		}
+
+		Result.Roadways.Append(NewEntry.Roadways);
+		Result.Sidewalks.Append(NewEntry.Sidewalks);
+		Result.Curbs.Append(NewEntry.Curbs);
+		Result.CurbLines.Append(NewEntry.CurbLines);
+	}
+	// Replace wholesale rather than merge in place -- any component that split, merged, or vanished
+	// (e.g. every one of its segments was removed) since the last rebuild has no business leaving a
+	// stale entry behind under an old key nothing will ever look up again.
+	CachedRoadComponents = MoveTemp(NewCachedRoadComponents);
+
+	// A null scope (or a scope containing a rail/non-rail segment respectively) means "assume
+	// relevant, recompute" -- only a scope that's known to touch neither ever reuses the cache, so
+	// RebuildAllNetworkGeometry (which marks every segment dirty before calling here with the full
+	// set) always recomputes both, exactly as before this caching was added.
+	bool bRailRelevant = !DirtySegmentsScope;
+	bool bMarkingRelevant = !DirtySegmentsScope;
+	if (DirtySegmentsScope)
+	{
+		for (FFlexSegmentId SegId : *DirtySegmentsScope)
+		{
+			const FFlexRoadSegment* Segment = Segments.Find(SegId);
+			if (!Segment || !Segment->Profile)
+			{
+				continue;
+			}
+			if (Segment->Profile->bIsRailProfile)
+			{
+				bRailRelevant = true;
+			}
+			else
+			{
+				bMarkingRelevant = true;
+			}
+		}
+	}
+
+	if (bRailRelevant)
+	{
+		CachedRailSections.Reset();
+		BuildRailMeshResults(CachedRailSections);
+	}
+	Result.Roadways.Append(CachedRailSections);
+
+	if (bMarkingRelevant)
+	{
+		CachedMarkingSections.Reset();
+		BuildRoadMarkingMeshResults(CachedMarkingSections);
+	}
+	Result.Markings = CachedMarkingSections;
+
+	if (bMarkingRelevant)
+	{
+		CachedBikeLaneSections.Reset();
+		BuildBikeLaneMeshResults(CachedBikeLaneSections);
+	}
+	Result.BikeLanes = CachedBikeLaneSections;
+
+	if (bMarkingRelevant)
+	{
+		CachedParkingLaneSections.Reset();
+		BuildParkingLaneMeshResults(CachedParkingLaneSections);
+	}
+	Result.ParkingLanes = CachedParkingLaneSections;
+
+	if (bMarkingRelevant)
+	{
+		CachedMedianTopSections.Reset();
+		CachedMedianWallSections.Reset();
+		BuildMedianMeshResults(CachedMedianTopSections, CachedMedianWallSections);
+	}
+	Result.Medians = CachedMedianTopSections;
+	Result.MedianCurbs = CachedMedianWallSections;
+
 	return Result;
 }
 
@@ -2203,9 +2962,17 @@ void UFlexNetworkSubsystem::RebuildDirty()
 		}
 	}
 
+	// A removal since the last rebuild means the dirty-segment scope can no longer be trusted to
+	// reveal every rail/marking/component-relevant change (the removed segment itself is
+	// unlookupable) -- fall back to an unscoped (always-recompute-everything) call in that case.
+	// Consumed here unconditionally (not just when Actor exists) so it can never "stick" across a
+	// visualization-mode switch.
+	const bool bForceUnscopedRebuild = bSegmentRemovedSinceLastRebuild;
+	bSegmentRemovedSinceLastRebuild = false;
 	if (Actor)
 	{
-		Actor->ApplyUnifiedNetworkMesh(BuildUnifiedClassicMeshResult());
+		const TSet<FFlexSegmentId>* UnifiedRebuildScope = bForceUnscopedRebuild ? nullptr : &FinalDirtySegments;
+		Actor->ApplyUnifiedNetworkMesh(BuildUnifiedClassicMeshResult(UnifiedRebuildScope));
 	}
 
 	// 6. The unified result owns road, junction, sidewalk and curb surfaces. Junction components

@@ -188,6 +188,34 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Materials")
 	TObjectPtr<UMaterialInterface> StandardMedianMaterial;
 
+	/** Material for solid road-marking lines (e.g. between opposite-direction lanes). */
+	UPROPERTY(EditAnywhere, Category = "Materials")
+	TObjectPtr<UMaterialInterface> StandardSolidMarkingMaterial;
+
+	/** Material for dashed lane-boundary markings. */
+	UPROPERTY(EditAnywhere, Category = "Materials")
+	TObjectPtr<UMaterialInterface> StandardLaneDashMarkingMaterial;
+
+	/** Material for dashed guide lines through intersections. */
+	UPROPERTY(EditAnywhere, Category = "Materials")
+	TObjectPtr<UMaterialInterface> StandardIntersectionDashMarkingMaterial;
+
+	/** Material for dashed crosswalk border markings. */
+	UPROPERTY(EditAnywhere, Category = "Materials")
+	TObjectPtr<UMaterialInterface> StandardCrosswalkDashMarkingMaterial;
+
+	/** Material for the bike-lane overlay strip drawn over every Bike-type lane. */
+	UPROPERTY(EditAnywhere, Category = "Materials")
+	TObjectPtr<UMaterialInterface> StandardBikeLaneMaterial;
+
+	/** Material for the divider line generated between adjacent parking bays on every Parking-type lane. */
+	UPROPERTY(EditAnywhere, Category = "Materials")
+	TObjectPtr<UMaterialInterface> StandardParkingMarkingMaterial;
+
+	/** Material for the road-surface overlay drawn over every Parking-type lane. */
+	UPROPERTY(EditAnywhere, Category = "Materials")
+	TObjectPtr<UMaterialInterface> StandardParkingLaneMaterial;
+
 	/** Overwrites the material slots above (whichever ones aren't left unset) on every URoadTypeProfile asset in the project and saves them -- a one-click alternative to hand-editing dozens of auto-generated OSM-import profiles individually. */
 	UFUNCTION(CallInEditor, Category = "Materials", meta = (DisplayName = "Apply Materials To All Profiles"))
 	void ApplyMaterialsToAllProfiles();

@@ -36,6 +36,17 @@ struct FLEXNETWORKRUNTIME_API FRoadLaneDescriptor
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Lane", meta = (ClampMin = "0.0", Units = "cm/s"))
 	float SpeedLimit = 1389.f; // ~50 km/h in cm/s
 
+	/**
+	 * Only meaningful for a Parking-type lane: orientation of the divider line generated between
+	 * adjacent parking bays (see FFlexRoadMarkingBuilder::BuildParkingSpotMarkings), from 0 deg
+	 * (parallel parking -- cars lie along the road, dividers run perpendicular to it) to 90 deg
+	 * (perpendicular/orthogonal parking -- cars sit crosswise, dividers run along the road). Does
+	 * not affect the spacing between dividers; see UFlexNetworkSettings::MarkingParkingSpotSpacing
+	 * for that.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Lane", meta = (ClampMin = "0.0", ClampMax = "90.0", Units = "deg"))
+	float ParkingAngleDegrees = 0.f;
+
 	/** Inner (LateralOffset - Width/2) edge of this lane. */
 	float GetInnerEdge() const { return LateralOffset - Width * 0.5f; }
 	/** Outer (LateralOffset + Width/2) edge of this lane. */
@@ -117,6 +128,29 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Profile", meta = (ClampMin = "0.0", Units = "cm"))
 	float CurbHeight = 15.f;
 
+	/**
+	 * Vertical height (cm) of every Median-type lane's raised top above the ordinary roadway
+	 * surface, with a curb wall of the same height along both its long edges (see
+	 * FFlexRoadMeshBuilder::AppendMedianOverlay) -- the same raised-island technique junction corner
+	 * refuges already use (see FFlexIntersectionBuilder's CornerIslands), applied along a segment's
+	 * own Median-type lane runs instead of a junction's approach gaps. 0 renders a Median lane flush
+	 * with the roadway (painted only, no physical curb).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Profile", meta = (ClampMin = "0.0", Units = "cm"))
+	float MedianHeight = 15.f;
+
+	/**
+	 * Network hierarchy this road type belongs to (motorway down to service), mirroring OSM's own
+	 * highway=* classification -- OSM-imported profiles derive this from their highway tag
+	 * automatically (see FFlexOsmGraphBuilder::ConfigureProfileFromLaneSignature); hand-authored
+	 * profiles should set it to whatever tier the road represents. Intended for a future
+	 * intersection right-of-way pass (right-before-left between equal levels, yield/stop for the
+	 * lower level at unequal crossings) to compare directly -- this field only carries the
+	 * classification today, nothing yet reads it to generate signals or signage.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Traffic Rules")
+	EFlexRoadDominanceLevel RoadDominanceLevel = EFlexRoadDominanceLevel::Unclassified;
+
 	/** Maximum grade (rise/run, e.g. 0.08 = 8%) this road type permits; enforced live while drawing. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Constraints", meta = (ClampMin = "0.001", ClampMax = "1.0"))
 	float MaxGrade = 0.08f;
@@ -149,6 +183,48 @@ public:
 	/** Fill for the rounded corner islands/refuges the sidewalk curves around at junctions (grass/landscaping is typical -- falls back to SidewalkMaterial if left unset). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")
 	TObjectPtr<UMaterialInterface> MedianMaterial = nullptr;
+
+	/**
+	 * Road-surface overlay drawn over every Bike-type lane (a thin strip sitting just above the
+	 * ordinary roadway, the same way markings sit above it -- the bike lane is still physically part
+	 * of the roadway, just visually distinguished). Leave unset to render Bike lanes as plain
+	 * roadway with no distinct overlay.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")
+	TObjectPtr<UMaterialInterface> BikeLaneMaterial = nullptr;
+
+	/**
+	 * Road-surface overlay drawn over every Parking-type lane, the same way BikeLaneMaterial
+	 * distinguishes Bike lanes -- a thin strip sitting just above the ordinary roadway; the parking
+	 * lane is still physically part of the roadway, just visually distinguished. Leave unset to
+	 * render Parking lanes as plain roadway with no distinct overlay.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering")
+	TObjectPtr<UMaterialInterface> ParkingLaneMaterial = nullptr;
+
+	/** Material for solid road-marking lines (e.g. between opposite-direction lanes). Leave unset to generate no solid markings for this profile. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering|Markings")
+	TObjectPtr<UMaterialInterface> SolidMarkingMaterial = nullptr;
+
+	/** Material for dashed lane-boundary markings (between same-direction lanes, or the sole boundary on a two-lane road). Leave unset to generate no lane dash markings for this profile. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering|Markings")
+	TObjectPtr<UMaterialInterface> LaneDashMarkingMaterial = nullptr;
+
+	/** Material for the dashed guide line generated on the left border of qualifying lane connectors through a junction (see UFlexNetworkSettings::bMarkingIntersectionLeftmostLaneOnly). Leave unset to generate no intersection dash markings for this profile. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering|Markings")
+	TObjectPtr<UMaterialInterface> IntersectionDashMarkingMaterial = nullptr;
+
+	/** Material for the short dashes placed orthogonal to the road along a crosswalk's two borders. Leave unset to generate no crosswalk dash markings for this profile. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering|Markings")
+	TObjectPtr<UMaterialInterface> CrosswalkDashMarkingMaterial = nullptr;
+
+	/** Material for the solid stop line generated in front of a crosswalk for its incoming lane(s). Leave unset to generate no stop lines for this profile. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering|Markings")
+	TObjectPtr<UMaterialInterface> StopLineMarkingMaterial = nullptr;
+
+	/** Material for the divider line generated between adjacent parking bays on every Parking-type lane. Leave unset to generate no parking-spot markings for this profile. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rendering|Markings")
+	TObjectPtr<UMaterialInterface> ParkingMarkingMaterial = nullptr;
 
 	/** Maximum distance (cm) from the segment spline to either outside sidewalk edge. */
 	float GetOuterExtent() const;

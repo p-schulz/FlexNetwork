@@ -121,6 +121,41 @@ float FFlexBezierMath::TToArcLength(const FFlexArcLengthTable& Table, float T)
 	return FMath::Lerp(A.ArcLength, B.ArcLength, Alpha);
 }
 
+float FFlexBezierMath::FindNearestArcLength(const FFlexBezierCurve& Curve, const FFlexArcLengthTable& Table, const FVector& TargetPosition)
+{
+	const float TotalLength = Table.GetTotalLength();
+	if (TotalLength <= KINDA_SMALL_NUMBER)
+	{
+		return 0.f;
+	}
+
+	float SearchMin = 0.f;
+	float SearchMax = TotalLength;
+	float BestArcLength = 0.f;
+	// Two coarse-to-fine passes: cheap, and precise enough (TotalLength/256 in the worst case) given
+	// callers pad around the result rather than relying on it being exact.
+	for (int32 Pass = 0; Pass < 2; ++Pass)
+	{
+		constexpr int32 NumSamples = 16;
+		float BestDistSq = MAX_flt;
+		for (int32 Index = 0; Index <= NumSamples; ++Index)
+		{
+			const float ArcLength = FMath::Lerp(SearchMin, SearchMax, static_cast<float>(Index) / NumSamples);
+			const float T = ArcLengthToT(Table, ArcLength);
+			const float DistSq = FVector::DistSquared(Evaluate(Curve, T), TargetPosition);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				BestArcLength = ArcLength;
+			}
+		}
+		const float Step = (SearchMax - SearchMin) / NumSamples;
+		SearchMin = FMath::Max(0.f, BestArcLength - Step);
+		SearchMax = FMath::Min(TotalLength, BestArcLength + Step);
+	}
+	return BestArcLength;
+}
+
 void FFlexBezierMath::Subdivide(const FFlexBezierCurve& Curve, float T, FFlexBezierCurve& OutLeft, FFlexBezierCurve& OutRight)
 {
 	const FVector P01 = FMath::Lerp(Curve.P0, Curve.P1, T);

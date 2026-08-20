@@ -1,6 +1,7 @@
 #include "FlexNetworkEdModeToolkit.h"
 #include "FlexNetworkEdMode.h"
 #include "FlexNetworkEdModeSettings.h"
+#include "FlexNetworkSettings.h"
 #include "PropertyEditorModule.h"
 #include "Modules/ModuleManager.h"
 #include "Widgets/SBoxPanel.h"
@@ -26,6 +27,22 @@ void FFlexNetworkEdModeToolkit::Init(const TSharedPtr<IToolkitHost>& InitToolkit
 		RoadSettingsView->SetObject(Mode->GetOrCreateModeSettings());
 	}
 
+	// Road-marking width/length/gap/toggle live on UFlexNetworkSettings (a project-wide
+	// UDeveloperSettings config object, not the transient per-session UFlexNetworkEdModeSettings
+	// above) -- see BuildRoadMarkingMeshResults for why: that generation runs in FlexNetworkRuntime,
+	// which cannot depend on this Editor-only module. A second details view, filtered down to just
+	// the "Road Markings" category, surfaces those same live settings here instead of only in
+	// Project Settings > Plugins > Flex Network -- editing a field here edits the same underlying
+	// object, so there is nothing to keep in sync.
+	const TSharedRef<IDetailsView> MarkingSettingsView = PropertyEditorModule.CreateDetailView(DetailsArgs);
+	MarkingSettingsView->SetIsPropertyVisibleDelegate(FIsPropertyVisible::CreateLambda(
+		[](const FPropertyAndParent& PropertyAndParent)
+		{
+			return PropertyAndParent.Property.HasMetaData(TEXT("Category"))
+				&& PropertyAndParent.Property.GetMetaData(TEXT("Category")) == TEXT("Road Markings");
+		}));
+	MarkingSettingsView->SetObject(GetMutableDefault<UFlexNetworkSettings>());
+
 	ToolkitWidget = SNew(SVerticalBox)
 		+ SVerticalBox::Slot()
 		.AutoHeight()
@@ -49,6 +66,17 @@ void FFlexNetworkEdModeToolkit::Init(const TSharedPtr<IToolkitHost>& InitToolkit
 		.FillHeight(1.f)
 		[
 			RoadSettingsView
+		]
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(4.f, 8.f, 4.f, 0.f)
+		[
+			SNew(STextBlock).Text(NSLOCTEXT("FlexNetwork", "MarkingSettingsLabel", "Road Markings (project-wide setting)"))
+		]
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		[
+			MarkingSettingsView
 		];
 }
 

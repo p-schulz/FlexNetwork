@@ -47,6 +47,28 @@ enum class EFlexLaneType : uint8
 	Rail
 };
 
+/**
+ * Road-network hierarchy for a URoadTypeProfile, mirroring OSM's own highway=* classification
+ * (motorway down to service). Declared in ascending numeric order of *decreasing* real-world
+ * importance, i.e. a lower enum value always outranks a higher one -- Motorway=0 is the most
+ * dominant, Service=7 the least. This ordering is what a future intersection right-of-way pass
+ * (right-before-left between equal levels, yield/stop for the lower level at unequal crossings)
+ * is meant to compare directly; this field only carries the classification, it does not yet drive
+ * any signal/signage generation.
+ */
+UENUM(BlueprintType)
+enum class EFlexRoadDominanceLevel : uint8
+{
+	Motorway,
+	Trunk,
+	Primary,
+	Secondary,
+	Tertiary,
+	Unclassified,
+	Residential,
+	Service
+};
+
 /** Direction of travel a lane allows, relative to the segment's start->end parameterization. */
 UENUM(BlueprintType)
 enum class EFlexLaneDirection : uint8

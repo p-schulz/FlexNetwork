@@ -11,6 +11,7 @@
 #include "Spatial/FlexSpatialGrid.h"
 #include "Terrain/IFlexTerrainConformer.h"
 #include "Export/IFlexNetworkExporter.h"
+#include "Mesh/FlexMeshSectionData.h"
 #include "FlexNetworkSubsystem.generated.h"
 
 class AFlexNetworkMeshActor;
@@ -18,9 +19,22 @@ class AFlexNetworkSegmentActor;
 class UFlexNetworkSettings;
 struct FFlexSegmentMeshResult;
 struct FFlexJunctionMeshResult;
-struct FFlexUnifiedNetworkMeshResult;
-struct FFlexMeshSectionData;
 struct FFlexUnifiedRoadPolygonInput;
+
+/**
+ * One connected road-graph component's cached unified road/sidewalk/curb mesh slice, plus the
+ * exact node membership it was built from -- BuildUnifiedClassicMeshResult compares this against
+ * the current rebuild's membership to detect a component split/merge and force a fresh build
+ * rather than risk reusing a slice that no longer corresponds to the same physical set of roads.
+ */
+struct FLEXNETWORKRUNTIME_API FFlexCachedRoadComponent
+{
+	TSet<FFlexNodeId> MemberNodeIds;
+	TArray<FFlexMeshSectionData> Roadways;
+	TArray<FFlexMeshSectionData> Sidewalks;
+	TArray<FFlexMeshSectionData> Curbs;
+	TArray<TArray<FVector>> CurbLines;
+};
 
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnRoadNetworkChangedNative, const TArray<FFlexNodeId>& /*ChangedNodes*/, const TArray<FFlexSegmentId>& /*ChangedSegments*/);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnRoadNetworkChangedDynamic, const TArray<FFlexNodeId>&, ChangedNodes, const TArray<FFlexSegmentId>&, ChangedSegments);
@@ -183,6 +197,38 @@ public:
 	 */
 	void BuildRailMeshResults(TArray<FFlexMeshSectionData>& OutResults) const;
 
+	/**
+	 * Builds road-marking geometry graph-wide, grouped one section per distinct material actually
+	 * used: solid lines between opposite-direction lanes, dashed lines between same-direction lanes
+	 * (or a two-lane road's sole boundary), dashed guide lines on the left border of qualifying
+	 * lanes through a junction (by default just the leftmost incoming lane's left-turn/straight
+	 * movements -- see UFlexNetworkSettings::bMarkingIntersectionLeftmostLaneOnly), short dashes
+	 * along both long edges of every crosswalk, and one divider line at every
+	 * UFlexNetworkSettings::MarkingParkingSpotSpacing interval along a Parking-type lane. A no-op if
+	 * UFlexNetworkSettings::bGenerateRoadMarkings is off, or if no profile has any marking material
+	 * configured. See Mesh/FlexRoadMarkingBuilder.h for the per-case generation logic.
+	 */
+	void BuildRoadMarkingMeshResults(TArray<FFlexMeshSectionData>& OutResults) const;
+
+	/**
+	 * Builds bike-lane overlay geometry graph-wide, grouped one section per distinct
+	 * BikeLaneMaterial actually used: a thin strip raised UFlexNetworkSettings::BikeLaneVerticalOffset
+	 * above the ordinary roadway surface for each contiguous run of Bike-type lanes in a segment's
+	 * profile (see FFlexRoadMeshBuilder::AppendBikeLaneOverlay). A no-op if no profile has a
+	 * BikeLaneMaterial configured.
+	 */
+	void BuildBikeLaneMeshResults(TArray<FFlexMeshSectionData>& OutResults) const;
+
+	/** Same reasoning as BuildBikeLaneMeshResults, for Parking-type lanes and ParkingLaneMaterial instead. */
+	void BuildParkingLaneMeshResults(TArray<FFlexMeshSectionData>& OutResults) const;
+
+	/**
+	 * Builds median-lane raised top and curb-wall geometry graph-wide, grouped one section per
+	 * distinct material actually used: OutTopResults uses each profile's MedianMaterial, OutWallResults
+	 * uses CurbMaterial (falling back to SidewalkMaterial) -- see FFlexRoadMeshBuilder::AppendMedianOverlay.
+	 */
+	void BuildMedianMeshResults(TArray<FFlexMeshSectionData>& OutTopResults, TArray<FFlexMeshSectionData>& OutWallResults) const;
+
 	/** Position/tangent/right/up at ArcLength along Segment -- lane positions use Profile.LateralOffset + Lane.LateralOffset. */
 	FFlexCurveFrame SampleSegmentAtArcLength(FFlexSegmentId SegmentId, float ArcLength) const;
 
@@ -256,8 +302,50 @@ private:
 	TSet<FFlexNodeId> DirtyNodes;
 	TSet<FFlexSegmentId> DirtySegments;
 	int32 BatchDepth = 0;
+
+	/**
+	 * Set whenever a segment is removed since the last RebuildDirty() call. A removed segment can
+	 * no longer be looked up, so it can never appear as a rail/non-rail hit in a dirty-segment scope
+	 * check -- without this, deleting a network's only rail segment (say) would leave
+	 * CachedRailSections permanently stale. RebuildDirty() forces a full (unscoped) rail/marking
+	 * recompute whenever this is set, then clears it.
+	 */
+	bool bSegmentRemovedSinceLastRebuild = false;
+
 	bool bTrafficSignalsChangedDuringBatch = false;
 	int32 NextComplexIntersectionRegionIndex = 0;
+
+	/**
+	 * Last-built rail/marking mesh results, reused by BuildUnifiedClassicMeshResult whenever the
+	 * current rebuild's dirty segment scope doesn't touch anything rail/marking-relevant (e.g.
+	 * editing an ordinary road segment with no rail neighbors never needs to recompute rail
+	 * geometry). Always fully recomputed when DirtySegmentsScope is null (unknown/full scope),
+	 * which is exactly what every dirty node/segment in the graph being marked dirty produces --
+	 * so RebuildAllNetworkGeometry's full rebuild behavior is unaffected by construction.
+	 */
+	UPROPERTY(Transient)
+	TArray<FFlexMeshSectionData> CachedRailSections;
+
+	UPROPERTY(Transient)
+	TArray<FFlexMeshSectionData> CachedMarkingSections;
+
+	/** Same reuse strategy as CachedMarkingSections, gated by the same "any dirty non-rail segment" scope check -- bike lane overlays are, like markings, a per-segment additive pass over the same non-rail segments. */
+	UPROPERTY(Transient)
+	TArray<FFlexMeshSectionData> CachedBikeLaneSections;
+
+	/** Same reuse strategy as CachedBikeLaneSections, for Parking-type lane overlay geometry. */
+	UPROPERTY(Transient)
+	TArray<FFlexMeshSectionData> CachedParkingLaneSections;
+
+	/** Same reuse strategy as CachedBikeLaneSections, for median top/wall geometry. */
+	UPROPERTY(Transient)
+	TArray<FFlexMeshSectionData> CachedMedianTopSections;
+
+	UPROPERTY(Transient)
+	TArray<FFlexMeshSectionData> CachedMedianWallSections;
+
+	/** One entry per connected road-graph component last seen by BuildUnifiedClassicMeshResult, keyed by that component's canonical (smallest-member-node-ID) key. Not a UPROPERTY: FFlexCachedRoadComponent's own TObjectPtr-bearing FFlexMeshSectionData entries are already kept alive by Segments' Profile references, and this cache is wholesale-replaced (never incrementally mutated) every rebuild, so nothing here needs to survive a GC pass on its own. */
+	TMap<FFlexNodeId, FFlexCachedRoadComponent> CachedRoadComponents;
 
 	AFlexNetworkMeshActor* GetOrCreateMeshActor();
 	AFlexNetworkSegmentActor* GetOrCreateSegmentActor(FFlexSegmentId SegmentId);
@@ -275,11 +363,27 @@ private:
 	/**
 	 * Recomputes arc-length tables, junction polygons/lane-connectors and terrain conforming for
 	 * everything touched since the last call. Classic rendering then rebuilds its unified footprint
-	 * globally because exposed boundary ownership can change across former component boundaries;
-	 * segment actors/PCG sources remain incremental. Every mutation method above ends here.
+	 * per connected road-graph component (see BuildUnifiedClassicMeshResult/CachedRoadComponents) --
+	 * only components a touched node/segment actually belongs to are recomputed, since exposed
+	 * boundary ownership can change across former sub-boundaries *within* a component but never
+	 * reaches into a disconnected one; segment actors/PCG sources remain incremental too. Every
+	 * mutation method above ends here.
 	 */
 	void RebuildDirty();
-	FFlexUnifiedNetworkMeshResult BuildUnifiedClassicMeshResult() const;
+
+	/**
+	 * DirtySegmentsScope, when non-null, restricts recomputation two ways:
+	 *  - Rail/marking mesh: only recomputed when the scope contains a rail-profile / an ordinary
+	 *    road-profile segment respectively; otherwise CachedRailSections/CachedMarkingSections are
+	 *    reused unchanged.
+	 *  - Road/sidewalk/curb mesh: computed per connected road-graph component (see
+	 *    CachedRoadComponents); a component is only rebuilt when the scope contains one of its
+	 *    member segments (or its cached membership no longer matches -- a split/merge always forces
+	 *    a rebuild regardless of scope).
+	 * Pass nullptr (the default) to force everything to recompute, which is what every caller
+	 * outside RebuildDirty's own incremental path should do.
+	 */
+	FFlexUnifiedNetworkMeshResult BuildUnifiedClassicMeshResult(const TSet<FFlexSegmentId>* DirtySegmentsScope = nullptr);
 	bool IsInternalComplexIntersectionSegment(const FFlexRoadSegment& Segment) const;
 	bool BuildComplexIntersectionRegionSurface(int32 RegionIndex, FFlexUnifiedRoadPolygonInput& OutSurface) const;
 	bool IsComplexIntersectionRegionOwner(FFlexNodeId NodeId) const;

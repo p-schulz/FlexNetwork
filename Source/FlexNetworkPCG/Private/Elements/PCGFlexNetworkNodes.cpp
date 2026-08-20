@@ -376,10 +376,12 @@ TArray<FPCGPinProperties> UPCGFlexRoadMeshesSettings::OutputPinProperties() cons
 TArray<FPCGPinProperties> UPCGFlexSidewalkMeshesSettings::OutputPinProperties() const { return { FPCGPinProperties(MeshPin, EPCGDataType::DynamicMesh), FPCGPinProperties(InfoPin, EPCGDataType::Param) }; }
 TArray<FPCGPinProperties> UPCGFlexIntersectionMeshesSettings::OutputPinProperties() const { return { FPCGPinProperties(SurfacesPin, EPCGDataType::DynamicMesh), FPCGPinProperties(CrosswalksPin, EPCGDataType::DynamicMesh), FPCGPinProperties(CornersPin, EPCGDataType::DynamicMesh), FPCGPinProperties(IslandsPin, EPCGDataType::DynamicMesh), FPCGPinProperties(InfoPin, EPCGDataType::Param) }; }
 TArray<FPCGPinProperties> UPCGFlexCurbMeshesSettings::OutputPinProperties() const { return { FPCGPinProperties(MeshPin, EPCGDataType::DynamicMesh), FPCGPinProperties(InfoPin, EPCGDataType::Param) }; }
+TArray<FPCGPinProperties> UPCGFlexRoadMarkingMeshesSettings::OutputPinProperties() const { return { FPCGPinProperties(MeshPin, EPCGDataType::DynamicMesh) }; }
 FPCGElementPtr UPCGFlexRoadMeshesSettings::CreateElement() const { return MakeShared<FPCGFlexRoadMeshesElement>(); }
 FPCGElementPtr UPCGFlexSidewalkMeshesSettings::CreateElement() const { return MakeShared<FPCGFlexSidewalkMeshesElement>(); }
 FPCGElementPtr UPCGFlexIntersectionMeshesSettings::CreateElement() const { return MakeShared<FPCGFlexIntersectionMeshesElement>(); }
 FPCGElementPtr UPCGFlexCurbMeshesSettings::CreateElement() const { return MakeShared<FPCGFlexCurbMeshesElement>(); }
+FPCGElementPtr UPCGFlexRoadMarkingMeshesSettings::CreateElement() const { return MakeShared<FPCGFlexRoadMarkingMeshesElement>(); }
 bool FPCGFlexRoadMeshesElement::ExecuteInternal(FPCGContext* Context) const { return GenerateSegments(Context, false); }
 bool FPCGFlexSidewalkMeshesElement::ExecuteInternal(FPCGContext* Context) const { return GenerateSegments(Context, true); }
 
@@ -569,5 +571,25 @@ bool FPCGFlexCurbMeshesElement::ExecuteInternal(FPCGContext* Context) const
 	}
 
 	AddInfo(Context, Info);
+	return true;
+}
+
+bool FPCGFlexRoadMarkingMeshesElement::ExecuteInternal(FPCGContext* Context) const
+{
+	const FFlexPCGSource Source = ResolveSource(Context);
+	UFlexNetworkSubsystem* Network = Source.Network;
+	if (!Network)
+	{
+		PCGE_LOG(Error, GraphAndLog, NSLOCTEXT("FlexNetworkPCG", "NoWorldMarking", "No FlexNetwork world subsystem is available."));
+		return true;
+	}
+
+	// World-scoped like rails: one section per distinct marking material, not per segment/junction.
+	TArray<FFlexMeshSectionData> MarkingSections;
+	Network->BuildRoadMarkingMeshResults(MarkingSections);
+	for (int32 Index = 0; Index < MarkingSections.Num(); ++Index)
+	{
+		AddMesh(Context, MarkingSections[Index], MeshPin, FString::Printf(TEXT("FlexRoadMarking:%d"), Index));
+	}
 	return true;
 }

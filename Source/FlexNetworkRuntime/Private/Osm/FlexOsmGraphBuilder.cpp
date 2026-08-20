@@ -18,6 +18,32 @@ namespace
 		return RailwayTag && Settings.RailwayTags.Contains(*RailwayTag);
 	}
 
+	/** Maps an OSM highway=* tag to the closest EFlexRoadDominanceLevel tier; *_link ramps inherit their parent class. Unrecognized/empty tags fall back to Unclassified, the same default a hand-authored profile starts with. */
+	EFlexRoadDominanceLevel MapHighwayTagToDominanceLevel(const FString& HighwayTag)
+	{
+		static const TMap<FString, EFlexRoadDominanceLevel> Mapping = {
+			{ TEXT("motorway"), EFlexRoadDominanceLevel::Motorway },
+			{ TEXT("motorway_link"), EFlexRoadDominanceLevel::Motorway },
+			{ TEXT("trunk"), EFlexRoadDominanceLevel::Trunk },
+			{ TEXT("trunk_link"), EFlexRoadDominanceLevel::Trunk },
+			{ TEXT("primary"), EFlexRoadDominanceLevel::Primary },
+			{ TEXT("primary_link"), EFlexRoadDominanceLevel::Primary },
+			{ TEXT("secondary"), EFlexRoadDominanceLevel::Secondary },
+			{ TEXT("secondary_link"), EFlexRoadDominanceLevel::Secondary },
+			{ TEXT("tertiary"), EFlexRoadDominanceLevel::Tertiary },
+			{ TEXT("tertiary_link"), EFlexRoadDominanceLevel::Tertiary },
+			{ TEXT("unclassified"), EFlexRoadDominanceLevel::Unclassified },
+			{ TEXT("residential"), EFlexRoadDominanceLevel::Residential },
+			{ TEXT("living_street"), EFlexRoadDominanceLevel::Residential },
+			{ TEXT("service"), EFlexRoadDominanceLevel::Service },
+		};
+		if (const EFlexRoadDominanceLevel* Level = Mapping.Find(HighwayTag))
+		{
+			return *Level;
+		}
+		return EFlexRoadDominanceLevel::Unclassified;
+	}
+
 	void CollectMatchingWayIds(const UOsmDataAsset& OsmAsset, const FFlexOsmImportSettings& Settings, TArray<int64>& OutWayIds)
 	{
 		OutWayIds.Reset();
@@ -713,6 +739,7 @@ void FFlexOsmGraphBuilder::ConfigureProfileFromLaneSignature(URoadTypeProfile& P
 	Profile.CurbHeight = 15.f;
 	Profile.MaxGrade = 0.08f;
 	Profile.MinTurnRadius = 800.f;
+	Profile.RoadDominanceLevel = MapHighwayTagToDominanceLevel(Signature.HighwayTag);
 }
 
 FVector2D FFlexOsmGraphBuilder::ProjectLatLonToLocalCm(double Lat, double Lon, double OriginLatDeg, double OriginLonDeg)

@@ -87,6 +87,9 @@ private:
 	bool bSelectedTangentIsStart = false;
 	TUniquePtr<FScopedTransaction> ActiveNodeEditTransaction;
 
+	/** True for the duration of a node-edit drag gesture that called UFlexNetworkSubsystem::BeginBatchUpdate() in StartTracking, so EndTracking knows to close it -- tracked separately from ActiveNodeEditTransaction since the subsystem might not have been available when the transaction was opened. */
+	bool bBatchedNodeEditUpdate = false;
+
 	/** Deletes whichever of SelectedNodeId/SelectedSegmentId is currently valid (node takes priority, matching HandleClick's mutual exclusivity), wrapped in one undo transaction. */
 	void DeleteSelection();
 

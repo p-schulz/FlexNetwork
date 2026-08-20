@@ -140,6 +140,22 @@ struct FLEXNETWORKRUNTIME_API FFlexSegmentMeshResult
 	UPROPERTY()
 	FFlexMeshSectionData Sidewalks;
 
+	/** Bike-lane overlay strip(s), raised slightly above Roadway -- empty unless Profile has Bike-type lanes and a BikeLaneMaterial configured. */
+	UPROPERTY()
+	FFlexMeshSectionData BikeLanes;
+
+	/** Median-lane raised top strip(s) -- empty unless Profile has Median-type lanes. See FFlexRoadMeshBuilder::AppendMedianOverlay. */
+	UPROPERTY()
+	FFlexMeshSectionData Median;
+
+	/** Median-lane curb wall(s) along both long edges of each Median run -- empty unless Profile has Median-type lanes and MedianHeight > 0. */
+	UPROPERTY()
+	FFlexMeshSectionData MedianCurb;
+
+	/** Parking-lane overlay strip(s), raised slightly above Roadway -- empty unless Profile has Parking-type lanes and a ParkingLaneMaterial configured. */
+	UPROPERTY()
+	FFlexMeshSectionData ParkingLanes;
+
 	/** Arc length (cm), measured from the segment's start (t=0), at which the road/sidewalk strips begin -- 0 unless trimmed by a junction at the start node. */
 	float TrimStartArcLength = 0.f;
 
@@ -188,6 +204,26 @@ struct FLEXNETWORKRUNTIME_API FFlexUnifiedNetworkMeshResult
 
 	UPROPERTY()
 	TArray<FFlexMeshSectionData> Curbs;
+
+	/** Road-marking geometry (solid lines, lane dashes, intersection guide dashes, crosswalk border dashes), one section per distinct material encountered. See UFlexNetworkSubsystem::BuildRoadMarkingMeshResults. */
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> Markings;
+
+	/** Bike-lane overlay strips, one section per distinct BikeLaneMaterial encountered, raised slightly above the roadway they sit on. */
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> BikeLanes;
+
+	/** Median-lane raised top strips, one section per distinct MedianMaterial encountered. See UFlexNetworkSubsystem::BuildMedianMeshResults. */
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> Medians;
+
+	/** Median-lane curb wall strips, one section per distinct CurbMaterial (falling back to SidewalkMaterial) encountered. */
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> MedianCurbs;
+
+	/** Parking-lane overlay strips, one section per distinct ParkingLaneMaterial encountered, raised slightly above the roadway they sit on. */
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> ParkingLanes;
 
 	/** Exposed unified curb-edge chords for the editor's optional static curbstone pass. */
 	TArray<TArray<FVector>> CurbLines;

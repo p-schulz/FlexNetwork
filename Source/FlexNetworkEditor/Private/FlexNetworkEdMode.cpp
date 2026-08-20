@@ -10,6 +10,7 @@
 #include "SceneView.h"
 #include "SceneManagement.h"
 #include "ScopedTransaction.h"
+#include "Misc/ScopeExit.h"
 #include "Engine/World.h"
 #include "Engine/HitResult.h"
 #include "Engine/EngineTypes.h"
@@ -440,6 +441,12 @@ void FFlexNetworkEdMode::CommitPlacement()
 		return;
 	}
 
+	// A placement crossing N existing roads calls SplitSegment/AddSegment 2N+1 times below; batching
+	// collapses all of their independent RebuildDirty() passes into exactly one at scope exit,
+	// instead of one full rebuild per crossing.
+	Subsystem->BeginBatchUpdate();
+	ON_SCOPE_EXIT { Subsystem->EndBatchUpdate(); };
+
 	FFlexBezierCurve FullCurve = PreviewCurve;
 	ReconcileCurveEndpoint(FullCurve, true, StartNodeId);
 	ReconcileCurveEndpoint(FullCurve, false, EndNodeId);
@@ -636,6 +643,14 @@ bool FFlexNetworkEdMode::StartTracking(FEditorViewportClient* InViewportClient, 
 				? NSLOCTEXT("FlexNetwork", "AdjustTangent", "Adjust Flex Road Tangent")
 				: NSLOCTEXT("FlexNetwork", "MoveNode", "Move Flex Road Node");
 		ActiveNodeEditTransaction = MakeUnique<FScopedTransaction>(TransactionText);
+		// A drag gesture calls InputDelta (and therefore SetNodePosition/RotateNode/SetSegmentCurve)
+		// once per viewport tick while the mouse moves; batching collapses every one of those
+		// independent RebuildDirty() passes into exactly one, fired from EndTracking below.
+		if (UFlexNetworkSubsystem* Subsystem = GetSubsystem())
+		{
+			Subsystem->BeginBatchUpdate();
+			bBatchedNodeEditUpdate = true;
+		}
 		return true;
 	}
 	return FEdMode::StartTracking(InViewportClient, InViewport);
@@ -646,6 +661,14 @@ bool FFlexNetworkEdMode::EndTracking(FEditorViewportClient* InViewportClient, FV
 	if (ActiveNodeEditTransaction.IsValid())
 	{
 		ActiveNodeEditTransaction.Reset();
+		if (bBatchedNodeEditUpdate)
+		{
+			bBatchedNodeEditUpdate = false;
+			if (UFlexNetworkSubsystem* Subsystem = GetSubsystem())
+			{
+				Subsystem->EndBatchUpdate();
+			}
+		}
 		return true;
 	}
 	return FEdMode::EndTracking(InViewportClient, InViewport);

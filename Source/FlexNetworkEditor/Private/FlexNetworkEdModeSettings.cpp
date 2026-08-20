@@ -466,13 +466,15 @@ void UFlexNetworkEdModeSettings::FitRoadsToTerrain()
 
 void UFlexNetworkEdModeSettings::ApplyMaterialsToAllProfiles()
 {
-	if (!StandardRoadMaterial && !StandardSidewalkMaterial && !StandardCrosswalkMaterial && !StandardJunctionMaterial && !StandardMedianMaterial)
+	if (!StandardRoadMaterial && !StandardSidewalkMaterial && !StandardCrosswalkMaterial && !StandardJunctionMaterial && !StandardMedianMaterial
+		&& !StandardSolidMarkingMaterial && !StandardLaneDashMarkingMaterial && !StandardIntersectionDashMarkingMaterial && !StandardCrosswalkDashMarkingMaterial && !StandardBikeLaneMaterial && !StandardParkingMarkingMaterial && !StandardParkingLaneMaterial)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: set at least one Standard*Material before applying."));
 		return;
 	}
 
-	const int32 NumModified = FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(StandardRoadMaterial, StandardSidewalkMaterial, StandardCrosswalkMaterial, StandardJunctionMaterial, StandardMedianMaterial);
+	const int32 NumModified = FlexNetworkAssetUtils::ApplyMaterialsToAllProfiles(StandardRoadMaterial, StandardSidewalkMaterial, StandardCrosswalkMaterial, StandardJunctionMaterial, StandardMedianMaterial,
+		StandardSolidMarkingMaterial, StandardLaneDashMarkingMaterial, StandardIntersectionDashMarkingMaterial, StandardCrosswalkDashMarkingMaterial, StandardBikeLaneMaterial, StandardParkingMarkingMaterial, StandardParkingLaneMaterial);
 	UE_LOG(LogTemp, Display, TEXT("FlexNetwork: applied materials to %d road profile asset(s)."), NumModified);
 }
 

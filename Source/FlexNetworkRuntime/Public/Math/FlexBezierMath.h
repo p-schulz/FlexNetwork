@@ -38,6 +38,15 @@ public:
 	/** Maps a curve parameter T in [0,1] to the corresponding arc length, via binary search + local linear interpolation in the table. */
 	static float TToArcLength(const FFlexArcLengthTable& Table, float T);
 
+	/**
+	 * Approximates the arc length of Curve's point nearest to TargetPosition via iterative
+	 * coarse-to-fine nearest-sample search (no analytic closest-point-on-Bezier solve). Good enough
+	 * for locating a roughly-on-curve point (e.g. a crosswalk placed at a known lateral offset from
+	 * the centerline) to within a small fraction of the curve's length; callers with a meaningful
+	 * tolerance for error should pad around the result rather than treat it as exact.
+	 */
+	static float FindNearestArcLength(const FFlexBezierCurve& Curve, const FFlexArcLengthTable& Table, const FVector& TargetPosition);
+
 	/** Applies an easing curve to Alpha in [0,1]; used to blend node elevation along a segment instead of linear interpolation. */
 	static float ApplyEase(EFlexElevationEase Ease, float Alpha);
 

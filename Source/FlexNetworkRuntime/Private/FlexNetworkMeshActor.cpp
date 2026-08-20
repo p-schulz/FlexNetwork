@@ -200,6 +200,26 @@ void AFlexNetworkMeshActor::ApplyUnifiedNetworkMesh(const FFlexUnifiedNetworkMes
 	{
 		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
 	}
+	for (const FFlexMeshSectionData& Section : MeshResult.Markings)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
+	for (const FFlexMeshSectionData& Section : MeshResult.BikeLanes)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
+	for (const FFlexMeshSectionData& Section : MeshResult.ParkingLanes)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
+	for (const FFlexMeshSectionData& Section : MeshResult.Medians)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
+	for (const FFlexMeshSectionData& Section : MeshResult.MedianCurbs)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
 }
 
 void AFlexNetworkMeshActor::ApplyCurbstones(const TArray<TArray<FVector>>& CurbLines, UStaticMesh* Mesh)

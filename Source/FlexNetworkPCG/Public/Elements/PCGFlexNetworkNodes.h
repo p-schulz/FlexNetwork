@@ -88,7 +88,25 @@ protected:
 	virtual FPCGElementPtr CreateElement() const override;
 };
 
+UCLASS(BlueprintType, ClassGroup=(Procedural))
+class FLEXNETWORKPCG_API UPCGFlexRoadMarkingMeshesSettings : public UPCGSettings
+{
+	GENERATED_BODY()
+public:
+#if WITH_EDITOR
+	virtual FName GetDefaultNodeName() const override { return TEXT("FlexRoadMarkingMeshes"); }
+	virtual FText GetDefaultNodeTitle() const override { return NSLOCTEXT("FlexNetworkPCG", "MarkingTitle", "Flex Network: Road Marking Meshes"); }
+	virtual FText GetNodeTooltipText() const override { return NSLOCTEXT("FlexNetworkPCG", "MarkingTip", "Generates road-marking geometry: solid lines between opposite-direction lanes, dashed lines between same-direction lanes (or a two-lane road's sole boundary), dashed guide lines on the left border of qualifying lanes through a junction (German-urban-style: leftmost lane, left/straight movements only, by default), and short dashes along both long edges of every crosswalk."); }
+	virtual EPCGSettingsType GetType() const override { return EPCGSettingsType::Spatial; }
+#endif
+	virtual TArray<FPCGPinProperties> InputPinProperties() const override { return {}; }
+	virtual TArray<FPCGPinProperties> OutputPinProperties() const override;
+protected:
+	virtual FPCGElementPtr CreateElement() const override;
+};
+
 class FPCGFlexRoadMeshesElement : public IPCGElement { protected: virtual bool ExecuteInternal(FPCGContext* Context) const override; };
 class FPCGFlexSidewalkMeshesElement : public IPCGElement { protected: virtual bool ExecuteInternal(FPCGContext* Context) const override; };
 class FPCGFlexIntersectionMeshesElement : public IPCGElement { protected: virtual bool ExecuteInternal(FPCGContext* Context) const override; };
 class FPCGFlexCurbMeshesElement : public IPCGElement { protected: virtual bool ExecuteInternal(FPCGContext* Context) const override; };
+class FPCGFlexRoadMarkingMeshesElement : public IPCGElement { protected: virtual bool ExecuteInternal(FPCGContext* Context) const override; };
