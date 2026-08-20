@@ -930,12 +930,17 @@ void FFlexNetworkEdMode::Render(const FSceneView* View, FViewport* Viewport, FPr
 	{
 		const FColor Color = bPreviewValid ? FColor::Green : FColor::Red;
 		constexpr int32 NumSamples = 24;
+		// bScreenSpace = true keeps this a constant width on screen -- without it, Thickness is a
+		// world-space size (cm), so the preview reads thinner and thinner as the viewport zooms out
+		// (the same handful of centimeters covers fewer and fewer screen pixels), eventually all but
+		// disappearing at typical level-overview zoom levels.
+		constexpr bool bScreenSpaceThickness = true;
 		FVector Prev = FFlexBezierMath::Evaluate(PreviewCurve, 0.f);
 		for (int32 i = 1; i <= NumSamples; ++i)
 		{
 			const float T = static_cast<float>(i) / static_cast<float>(NumSamples);
 			const FVector Next = FFlexBezierMath::Evaluate(PreviewCurve, T);
-			PDI->DrawLine(Prev, Next, Color, SDPG_Foreground, 4.f);
+			PDI->DrawLine(Prev, Next, Color, SDPG_Foreground, 4.f, 0.f, bScreenSpaceThickness);
 			Prev = Next;
 		}
 	}
