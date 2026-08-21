@@ -35,8 +35,7 @@ public:
 		float SampleStep,
 		float TrimStartArcLength,
 		float TrimEndArcLength,
-		float BikeLaneVerticalOffset = 0.3f,
-		float ParkingLaneVerticalOffset = 0.3f);
+		float BikeLaneVerticalOffset = 0.3f);
 
 	/** Frame at a single arc-length position, used both internally and by the subsystem's SampleSegmentAtArcLength query API. */
 	static FFlexCurveFrame SampleFrameAtArcLength(const FFlexBezierCurve& Curve, const FFlexArcLengthTable& ArcLengthTable, float ArcLength, const FVector& ReferenceUp);
@@ -64,14 +63,25 @@ public:
 	static void AppendParkingLaneOverlay(FFlexMeshSectionData& Section, const TArray<FFlexCurveFrame>& Frames, const URoadTypeProfile& Profile, float VerticalOffset);
 
 	/**
-	 * Appends a single vertical quad strip along Frames at lateral offset LateralOffset, from the
-	 * roadway surface up to WallHeight -- the curb "face" on one long edge of a raised strip (e.g.
-	 * one side of a median). Winding is auto-detected against the intended outward normal
+	 * Appends a single vertical quad strip along Frames at lateral offset LateralOffset, from
+	 * BaseVerticalOffset up to BaseVerticalOffset + WallHeight -- the curb "face" on one long edge of
+	 * a raised strip (e.g. one side of a median, or a tree patch sitting BaseVerticalOffset above the
+	 * sidewalk it's embedded in). Winding is auto-detected against the intended outward normal
 	 * (bOutwardIsPositiveLateral picks +Right or -Right) the same way
 	 * FlexUnifiedRoadMeshBuilder::AppendCurbEdge resolves it for the boolean-union curb pass, rather
 	 * than relying on a fixed hand-picked corner order. A no-op if WallHeight is ~0.
 	 */
-	static void AppendVerticalCurbWall(FFlexMeshSectionData& Section, const TArray<FFlexCurveFrame>& Frames, float LateralOffset, float WallHeight, bool bOutwardIsPositiveLateral);
+	static void AppendVerticalCurbWall(FFlexMeshSectionData& Section, const TArray<FFlexCurveFrame>& Frames, float LateralOffset, float BaseVerticalOffset, float WallHeight, bool bOutwardIsPositiveLateral);
+
+	/**
+	 * Appends a single vertical quad "end cap" at Frame's own arc-length position, spanning laterally
+	 * [LateralMinOffset, LateralMaxOffset] and vertically [BaseVerticalOffset, BaseVerticalOffset +
+	 * WallHeight] -- the short face closing off one end of an isolated patch (as opposed to
+	 * AppendVerticalCurbWall's long edges, which run along Frames). Same auto-detected-winding
+	 * technique as AppendVerticalCurbWall, oriented along Frame.Tangent instead of Frame.Right
+	 * (bOutwardIsPositiveTangent picks +Tangent or -Tangent). A no-op if WallHeight is ~0.
+	 */
+	static void AppendVerticalEndCapWall(FFlexMeshSectionData& Section, const FFlexCurveFrame& Frame, float LateralMinOffset, float LateralMaxOffset, float BaseVerticalOffset, float WallHeight, bool bOutwardIsPositiveTangent);
 
 	/**
 	 * Appends one raised top strip (into OutTop) and two AppendVerticalCurbWall side walls (into
@@ -81,4 +91,38 @@ public:
 	 * if Profile has no Median-type lanes.
 	 */
 	static void AppendMedianOverlay(FFlexMeshSectionData& OutTop, FFlexMeshSectionData& OutWalls, const TArray<FFlexCurveFrame>& Frames, const URoadTypeProfile& Profile, float MedianHeight);
+
+	/**
+	 * Appends two AppendVerticalCurbWall walls (both long edges, roadway-surface base) per
+	 * contiguous run of Parking-type lanes in Profile -- see URoadTypeProfile::bGenerateParkingLaneCurbs.
+	 * No top surface: the parking lane's own drivable surface is already part of the ordinary
+	 * roadway strip, only its physical boundary is new here. A no-op if Profile has no Parking-type
+	 * lanes or WallHeight is ~0.
+	 */
+	static void AppendParkingLaneCurbs(FFlexMeshSectionData& OutWalls, const TArray<FFlexCurveFrame>& Frames, const URoadTypeProfile& Profile, float WallHeight);
+
+	/**
+	 * Appends one small, fully-curbed rectangular patch (top into OutTop, all four curb walls into
+	 * OutWalls) at every PatchSpacing interval along [TrimStartArcLength, TrimEndArcLength], spanning
+	 * laterally between PatchLateralOffsetA and PatchLateralOffsetB (either order) and vertically from
+	 * BaseVerticalOffset (the sidewalk surface it's embedded in) up to BaseVerticalOffset +
+	 * PatchHeight -- a tree pit / planting island. Each patch is built from exactly two frames the
+	 * same way FlexRoadMarkingBuilder's dash primitive is (a SampleStep equal to PatchLength), since a
+	 * patch this small doesn't need finer sampling even on a curved segment. A no-op unless
+	 * PatchSpacing/PatchLength and the resolved patch width are all positive.
+	 */
+	static void AppendSidewalkTreePatches(
+		FFlexMeshSectionData& OutTop,
+		FFlexMeshSectionData& OutWalls,
+		const FFlexBezierCurve& Curve,
+		const FFlexArcLengthTable& ArcLengthTable,
+		const FVector& ReferenceUp,
+		float PatchLateralOffsetA,
+		float PatchLateralOffsetB,
+		float BaseVerticalOffset,
+		float PatchHeight,
+		float PatchLength,
+		float PatchSpacing,
+		float TrimStartArcLength,
+		float TrimEndArcLength);
 };

@@ -25,13 +25,19 @@ namespace FlexRoadMeshBuilderTestHelpers
 		return Profile;
 	}
 
-	TArray<FFlexCurveFrame> MakeStraightFrames()
+	FFlexBezierCurve MakeStraightCurve()
 	{
 		FFlexBezierCurve Curve;
 		Curve.P0 = FVector(0, 0, 0);
 		Curve.P1 = FVector(1000, 0, 0);
 		Curve.P2 = FVector(2000, 0, 0);
 		Curve.P3 = FVector(3000, 0, 0);
+		return Curve;
+	}
+
+	TArray<FFlexCurveFrame> MakeStraightFrames()
+	{
+		const FFlexBezierCurve Curve = MakeStraightCurve();
 		const FFlexArcLengthTable Table = FFlexBezierMath::BuildArcLengthTable(Curve);
 		return FFlexRoadMeshBuilder::BuildFramesForRange(Curve, Table, FVector::UpVector, 100.f, 0.f, Table.GetTotalLength());
 	}
@@ -259,6 +265,128 @@ bool FFlexParkingLaneOverlaySelectsParkingTypeTest::RunTest(const FString& Param
 	URoadTypeProfile* VehicleOnlyProfile = MakeProfile({ MakeLane(0.f, 350.f, EFlexLaneType::Vehicle) });
 	FFlexRoadMeshBuilder::AppendParkingLaneOverlay(VehicleOnlySection, Frames, *VehicleOnlyProfile, 0.3f);
 	TestTrue(TEXT("A profile with no Parking lanes produces no parking-overlay geometry"), VehicleOnlySection.IsEmpty());
+
+	return true;
+}
+
+// AppendParkingLaneCurbs produces two curb wall strips (one per long edge) and no top surface --
+// the parking lane's own drivable surface is already part of the ordinary roadway.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFlexParkingLaneCurbsGeometryTest, "FlexNetwork.Mesh.ParkingLaneCurbsGenerateWallsOnly", EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FFlexParkingLaneCurbsGeometryTest::RunTest(const FString& Parameters)
+{
+	using namespace FlexRoadMeshBuilderTestHelpers;
+
+	URoadTypeProfile* Profile = MakeProfile({
+		MakeLane(0.f, 200.f, EFlexLaneType::Parking)
+	});
+
+	const TArray<FFlexCurveFrame> Frames = MakeStraightFrames();
+	FFlexMeshSectionData Walls;
+	FFlexRoadMeshBuilder::AppendParkingLaneCurbs(Walls, Frames, *Profile, 15.f);
+
+	TestFalse(TEXT("A Parking lane run produces curb wall geometry"), Walls.IsEmpty());
+	const int32 ExpectedQuadsPerStrip = Frames.Num() - 1;
+	TestEqual(TEXT("Two walls (one per long edge)"), Walls.Triangles.Num() / 3, ExpectedQuadsPerStrip * 2 * 2);
+
+	// BaseVerticalOffset is 0 (roadway surface) for parking lane curbs, so every wall vertex sits at
+	// either the roadway surface or WallHeight above it.
+	int32 NumBottom = 0, NumTop = 0;
+	for (const FVector& Vertex : Walls.Vertices)
+	{
+		if (FMath::IsNearlyEqual(static_cast<float>(Vertex.Z), 0.f, KINDA_SMALL_NUMBER)) ++NumBottom;
+		else if (FMath::IsNearlyEqual(static_cast<float>(Vertex.Z), 15.f, KINDA_SMALL_NUMBER)) ++NumTop;
+	}
+	TestEqual(TEXT("Half the wall vertices sit at the roadway surface"), NumBottom, Walls.Vertices.Num() / 2);
+	TestEqual(TEXT("Half the wall vertices sit at WallHeight"), NumTop, Walls.Vertices.Num() / 2);
+
+	return true;
+}
+
+// A profile with no Parking lanes, or with bGenerateParkingLaneCurbs left off (checked at the
+// caller, not inside AppendParkingLaneCurbs itself -- this test covers the "no Parking lanes" half
+// of that gating directly), produces no curb geometry.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFlexParkingLaneCurbsNoOpTest, "FlexNetwork.Mesh.ParkingLaneCurbsNoOpWithoutParkingLanes", EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FFlexParkingLaneCurbsNoOpTest::RunTest(const FString& Parameters)
+{
+	using namespace FlexRoadMeshBuilderTestHelpers;
+
+	URoadTypeProfile* Profile = MakeProfile({
+		MakeLane(-175.f, 350.f, EFlexLaneType::Vehicle),
+		MakeLane(175.f, 350.f, EFlexLaneType::Vehicle)
+	});
+
+	const TArray<FFlexCurveFrame> Frames = MakeStraightFrames();
+	FFlexMeshSectionData Walls;
+	FFlexRoadMeshBuilder::AppendParkingLaneCurbs(Walls, Frames, *Profile, 15.f);
+
+	TestTrue(TEXT("A profile with no Parking lanes produces no parking curb geometry"), Walls.IsEmpty());
+
+	return true;
+}
+
+// Sidewalk tree patches: one small raised+curbed island every PatchSpacing interval, each with a
+// top cap (1 quad) and four curb walls (2 long edges + 2 end caps, 1 quad each), sitting
+// BaseVerticalOffset above the roadway and PatchHeight above that.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFlexSidewalkTreePatchesGeometryTest, "FlexNetwork.Mesh.SidewalkTreePatchesGenerateSpacedIslands", EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FFlexSidewalkTreePatchesGeometryTest::RunTest(const FString& Parameters)
+{
+	using namespace FlexRoadMeshBuilderTestHelpers;
+
+	const FFlexBezierCurve Curve = MakeStraightCurve();
+	const FFlexArcLengthTable Table = FFlexBezierMath::BuildArcLengthTable(Curve);
+
+	FFlexMeshSectionData Top, Walls;
+	FFlexRoadMeshBuilder::AppendSidewalkTreePatches(Top, Walls, Curve, Table, FVector::UpVector,
+		/*PatchLateralOffsetA*/ -300.f, /*PatchLateralOffsetB*/ -200.f,
+		/*BaseVerticalOffset*/ 20.f, /*PatchHeight*/ 10.f, /*PatchLength*/ 150.f, /*PatchSpacing*/ 800.f,
+		/*TrimStart*/ 0.f, /*TrimEnd*/ 3000.f);
+
+	TestFalse(TEXT("Tree patches produce top geometry"), Top.IsEmpty());
+	TestFalse(TEXT("Tree patches produce curb wall geometry"), Walls.IsEmpty());
+
+	// Patch centers at 400, 1200, 2000, 2800 (TrimStart + Spacing/2, then every 800, staying below
+	// TrimEnd=3000) -- four patches, none clipped by the trim range since each sits well inside it.
+	constexpr int32 ExpectedPatchCount = 4;
+	TestEqual(TEXT("One top quad (2 triangles) per patch"), Top.Triangles.Num() / 3, ExpectedPatchCount * 2);
+	// Per patch: 2 long-edge walls + 2 end caps, one quad (2 triangles) each = 8 triangles/patch.
+	TestEqual(TEXT("Four curb-wall quads per patch (2 long edges + 2 end caps)"), Walls.Triangles.Num() / 3, ExpectedPatchCount * 8);
+
+	for (const FVector& Vertex : Top.Vertices)
+	{
+		TestEqual(TEXT("Every top vertex sits BaseVerticalOffset + PatchHeight above the roadway"), static_cast<float>(Vertex.Z), 30.f, KINDA_SMALL_NUMBER);
+	}
+
+	int32 NumBottom = 0, NumTop = 0;
+	for (const FVector& Vertex : Walls.Vertices)
+	{
+		if (FMath::IsNearlyEqual(static_cast<float>(Vertex.Z), 20.f, KINDA_SMALL_NUMBER)) ++NumBottom;
+		else if (FMath::IsNearlyEqual(static_cast<float>(Vertex.Z), 30.f, KINDA_SMALL_NUMBER)) ++NumTop;
+	}
+	TestEqual(TEXT("Half the wall vertices sit at BaseVerticalOffset (the sidewalk surface)"), NumBottom, Walls.Vertices.Num() / 2);
+	TestEqual(TEXT("Half the wall vertices sit at BaseVerticalOffset + PatchHeight"), NumTop, Walls.Vertices.Num() / 2);
+
+	return true;
+}
+
+// A degenerate patch width (both lateral offsets equal) produces no geometry at all.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFlexSidewalkTreePatchesZeroWidthTest, "FlexNetwork.Mesh.SidewalkTreePatchesNoOpForZeroWidth", EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+
+bool FFlexSidewalkTreePatchesZeroWidthTest::RunTest(const FString& Parameters)
+{
+	using namespace FlexRoadMeshBuilderTestHelpers;
+
+	const FFlexBezierCurve Curve = MakeStraightCurve();
+	const FFlexArcLengthTable Table = FFlexBezierMath::BuildArcLengthTable(Curve);
+
+	FFlexMeshSectionData Top, Walls;
+	FFlexRoadMeshBuilder::AppendSidewalkTreePatches(Top, Walls, Curve, Table, FVector::UpVector,
+		-300.f, -300.f, 20.f, 10.f, 150.f, 800.f, 0.f, 3000.f);
+
+	TestTrue(TEXT("A zero-width patch span produces no top geometry"), Top.IsEmpty());
+	TestTrue(TEXT("A zero-width patch span produces no wall geometry"), Walls.IsEmpty());
 
 	return true;
 }

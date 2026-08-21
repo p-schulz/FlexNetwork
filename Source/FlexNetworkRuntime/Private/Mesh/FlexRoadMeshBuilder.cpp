@@ -10,23 +10,24 @@ namespace
 	constexpr float kUvMetersScale = 100.f;
 
 	/**
-	 * Shared implementation behind AppendBikeLaneOverlay/AppendParkingLaneOverlay: merges every
-	 * contiguous run of LaneType lanes in Profile (adjacent same-type lanes with nothing else
-	 * between them share one strip) into one raised strip each, VerticalOffset above the ordinary
-	 * roadway surface Frames already describes.
+	 * Invokes VisitRun(RunInner, RunOuter) once per contiguous run of LaneType lanes in Profile
+	 * (adjacent same-type lanes with nothing else between them share one run; two runs separated by
+	 * a different-type lane get two separate calls). Shared by every per-lane-type overlay/curb
+	 * generator (bike/parking lane overlays, median top+walls, parking lane curbs) so the run-merging
+	 * logic itself lives in exactly one place.
 	 */
-	void AppendLaneTypeOverlay(FFlexMeshSectionData& Section, const TArray<FFlexCurveFrame>& Frames, const URoadTypeProfile& Profile, EFlexLaneType LaneType, float VerticalOffset)
+	void ForEachLaneTypeRun(const URoadTypeProfile& Profile, EFlexLaneType LaneType, TFunctionRef<void(float RunInner, float RunOuter)> VisitRun)
 	{
 		const TArray<FRoadLaneDescriptor> SortedLanes = Profile.GetLanesSortedByOffset();
 
 		bool bInRun = false;
 		float RunInner = 0.f;
 		float RunOuter = 0.f;
-		auto FlushRun = [&Section, &Frames, VerticalOffset, &bInRun, &RunInner, &RunOuter]()
+		auto FlushRun = [&VisitRun, &bInRun, &RunInner, &RunOuter]()
 		{
 			if (bInRun && RunOuter - RunInner > KINDA_SMALL_NUMBER)
 			{
-				FFlexRoadMeshBuilder::AppendExtrudedStrip(Section, Frames, RunInner, RunOuter, VerticalOffset);
+				VisitRun(RunInner, RunOuter);
 			}
 			bInRun = false;
 		};
@@ -54,6 +55,15 @@ namespace
 			}
 		}
 		FlushRun();
+	}
+
+	/** Shared implementation behind AppendBikeLaneOverlay/AppendParkingLaneOverlay. */
+	void AppendLaneTypeOverlay(FFlexMeshSectionData& Section, const TArray<FFlexCurveFrame>& Frames, const URoadTypeProfile& Profile, EFlexLaneType LaneType, float VerticalOffset)
+	{
+		ForEachLaneTypeRun(Profile, LaneType, [&Section, &Frames, VerticalOffset](float RunInner, float RunOuter)
+		{
+			FFlexRoadMeshBuilder::AppendExtrudedStrip(Section, Frames, RunInner, RunOuter, VerticalOffset);
+		});
 	}
 }
 
@@ -96,7 +106,7 @@ void FFlexRoadMeshBuilder::AppendParkingLaneOverlay(FFlexMeshSectionData& Sectio
 	AppendLaneTypeOverlay(Section, Frames, Profile, EFlexLaneType::Parking, VerticalOffset);
 }
 
-void FFlexRoadMeshBuilder::AppendVerticalCurbWall(FFlexMeshSectionData& Section, const TArray<FFlexCurveFrame>& Frames, float LateralOffset, float WallHeight, bool bOutwardIsPositiveLateral)
+void FFlexRoadMeshBuilder::AppendVerticalCurbWall(FFlexMeshSectionData& Section, const TArray<FFlexCurveFrame>& Frames, float LateralOffset, float BaseVerticalOffset, float WallHeight, bool bOutwardIsPositiveLateral)
 {
 	if (Frames.Num() < 2 || WallHeight <= KINDA_SMALL_NUMBER)
 	{
@@ -109,9 +119,9 @@ void FFlexRoadMeshBuilder::AppendVerticalCurbWall(FFlexMeshSectionData& Section,
 		const FFlexCurveFrame& F0 = Frames[i];
 		const FFlexCurveFrame& F1 = Frames[i + 1];
 
-		const FVector BottomA = F0.Position + F0.Right * LateralOffset;
+		const FVector BottomA = F0.Position + F0.Right * LateralOffset + F0.Up * BaseVerticalOffset;
 		const FVector TopA = BottomA + F0.Up * WallHeight;
-		const FVector BottomB = F1.Position + F1.Right * LateralOffset;
+		const FVector BottomB = F1.Position + F1.Right * LateralOffset + F1.Up * BaseVerticalOffset;
 		const FVector TopB = BottomB + F1.Up * WallHeight;
 		const FVector NormalA = (F0.Right * OutwardSign).GetSafeNormal();
 		const FVector NormalB = (F1.Right * OutwardSign).GetSafeNormal();
@@ -137,47 +147,99 @@ void FFlexRoadMeshBuilder::AppendVerticalCurbWall(FFlexMeshSectionData& Section,
 	}
 }
 
+void FFlexRoadMeshBuilder::AppendVerticalEndCapWall(FFlexMeshSectionData& Section, const FFlexCurveFrame& Frame, float LateralMinOffset, float LateralMaxOffset, float BaseVerticalOffset, float WallHeight, bool bOutwardIsPositiveTangent)
+{
+	if (WallHeight <= KINDA_SMALL_NUMBER || LateralMaxOffset - LateralMinOffset <= KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+
+	const FVector BottomMin = Frame.Position + Frame.Right * LateralMinOffset + Frame.Up * BaseVerticalOffset;
+	const FVector BottomMax = Frame.Position + Frame.Right * LateralMaxOffset + Frame.Up * BaseVerticalOffset;
+	const FVector TopMin = BottomMin + Frame.Up * WallHeight;
+	const FVector TopMax = BottomMax + Frame.Up * WallHeight;
+	const float OutwardSign = bOutwardIsPositiveTangent ? 1.f : -1.f;
+	const FVector Normal = (Frame.Tangent * OutwardSign).GetSafeNormal();
+
+	// Same auto-detected-winding technique as AppendVerticalCurbWall, just against a Tangent-facing
+	// Normal instead of a Right-facing one.
+	const FVector Cross = FVector::CrossProduct(BottomMax - BottomMin, TopMin - BottomMin);
+	if (FVector::DotProduct(Cross, Normal) > 0.f)
+	{
+		Section.AppendQuad(BottomMin, TopMin, TopMax, BottomMax, Normal, Frame.Right,
+			FVector2D(0.f, 0.f), FVector2D(0.f, 1.f), FVector2D(1.f, 1.f), FVector2D(1.f, 0.f));
+	}
+	else
+	{
+		Section.AppendQuad(BottomMin, BottomMax, TopMax, TopMin, Normal, Frame.Right,
+			FVector2D(0.f, 0.f), FVector2D(1.f, 0.f), FVector2D(1.f, 1.f), FVector2D(0.f, 1.f));
+	}
+}
+
 void FFlexRoadMeshBuilder::AppendMedianOverlay(FFlexMeshSectionData& OutTop, FFlexMeshSectionData& OutWalls, const TArray<FFlexCurveFrame>& Frames, const URoadTypeProfile& Profile, float MedianHeight)
 {
-	const TArray<FRoadLaneDescriptor> SortedLanes = Profile.GetLanesSortedByOffset();
-
-	bool bInRun = false;
-	float RunInner = 0.f;
-	float RunOuter = 0.f;
-	auto FlushRun = [&OutTop, &OutWalls, &Frames, MedianHeight, &bInRun, &RunInner, &RunOuter]()
+	ForEachLaneTypeRun(Profile, EFlexLaneType::Median, [&OutTop, &OutWalls, &Frames, MedianHeight](float RunInner, float RunOuter)
 	{
-		if (bInRun && RunOuter - RunInner > KINDA_SMALL_NUMBER)
-		{
-			AppendExtrudedStrip(OutTop, Frames, RunInner, RunOuter, MedianHeight);
-			AppendVerticalCurbWall(OutWalls, Frames, RunInner, MedianHeight, false);
-			AppendVerticalCurbWall(OutWalls, Frames, RunOuter, MedianHeight, true);
-		}
-		bInRun = false;
-	};
+		AppendExtrudedStrip(OutTop, Frames, RunInner, RunOuter, MedianHeight);
+		AppendVerticalCurbWall(OutWalls, Frames, RunInner, 0.f, MedianHeight, false);
+		AppendVerticalCurbWall(OutWalls, Frames, RunOuter, 0.f, MedianHeight, true);
+	});
+}
 
-	for (const FRoadLaneDescriptor& Lane : SortedLanes)
+void FFlexRoadMeshBuilder::AppendParkingLaneCurbs(FFlexMeshSectionData& OutWalls, const TArray<FFlexCurveFrame>& Frames, const URoadTypeProfile& Profile, float WallHeight)
+{
+	ForEachLaneTypeRun(Profile, EFlexLaneType::Parking, [&OutWalls, &Frames, WallHeight](float RunInner, float RunOuter)
 	{
-		if (Lane.Type != EFlexLaneType::Median)
+		AppendVerticalCurbWall(OutWalls, Frames, RunInner, 0.f, WallHeight, false);
+		AppendVerticalCurbWall(OutWalls, Frames, RunOuter, 0.f, WallHeight, true);
+	});
+}
+
+void FFlexRoadMeshBuilder::AppendSidewalkTreePatches(
+	FFlexMeshSectionData& OutTop, FFlexMeshSectionData& OutWalls,
+	const FFlexBezierCurve& Curve, const FFlexArcLengthTable& ArcLengthTable, const FVector& ReferenceUp,
+	float PatchLateralOffsetA, float PatchLateralOffsetB, float BaseVerticalOffset, float PatchHeight,
+	float PatchLength, float PatchSpacing, float TrimStartArcLength, float TrimEndArcLength)
+{
+	if (PatchSpacing <= KINDA_SMALL_NUMBER || PatchLength <= KINDA_SMALL_NUMBER
+		|| TrimEndArcLength - TrimStartArcLength <= KINDA_SMALL_NUMBER || !ArcLengthTable.IsValid())
+	{
+		return;
+	}
+
+	const float InnerOffset = FMath::Min(PatchLateralOffsetA, PatchLateralOffsetB);
+	const float OuterOffset = FMath::Max(PatchLateralOffsetA, PatchLateralOffsetB);
+	if (OuterOffset - InnerOffset <= KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+
+	// One patch centered at every PatchSpacing interval, starting half a spacing in so a patch
+	// doesn't sit flush against the span's own open end.
+	for (float Center = TrimStartArcLength + PatchSpacing * 0.5f; Center < TrimEndArcLength; Center += PatchSpacing)
+	{
+		const float SpanStart = FMath::Max(TrimStartArcLength, Center - PatchLength * 0.5f);
+		const float SpanEnd = FMath::Min(TrimEndArcLength, Center + PatchLength * 0.5f);
+		if (SpanEnd - SpanStart <= KINDA_SMALL_NUMBER)
 		{
-			FlushRun();
 			continue;
 		}
 
-		const float AbsInner = Profile.LateralOffset + FMath::Min(Lane.GetInnerEdge(), Lane.GetOuterEdge());
-		const float AbsOuter = Profile.LateralOffset + FMath::Max(Lane.GetInnerEdge(), Lane.GetOuterEdge());
-		if (!bInRun)
+		// Exactly two frames (start/end of this patch's short span) -- the same technique
+		// FlexRoadMarkingBuilder's dash primitive uses, since a patch this small doesn't benefit
+		// from finer sampling even on a curved segment.
+		const TArray<FFlexCurveFrame> PatchFrames = BuildFramesForRange(Curve, ArcLengthTable, ReferenceUp, PatchLength, SpanStart, SpanEnd);
+		if (PatchFrames.Num() < 2)
 		{
-			bInRun = true;
-			RunInner = AbsInner;
-			RunOuter = AbsOuter;
+			continue;
 		}
-		else
-		{
-			RunInner = FMath::Min(RunInner, AbsInner);
-			RunOuter = FMath::Max(RunOuter, AbsOuter);
-		}
+
+		AppendExtrudedStrip(OutTop, PatchFrames, InnerOffset, OuterOffset, BaseVerticalOffset + PatchHeight);
+		AppendVerticalCurbWall(OutWalls, PatchFrames, InnerOffset, BaseVerticalOffset, PatchHeight, false);
+		AppendVerticalCurbWall(OutWalls, PatchFrames, OuterOffset, BaseVerticalOffset, PatchHeight, true);
+		AppendVerticalEndCapWall(OutWalls, PatchFrames[0], InnerOffset, OuterOffset, BaseVerticalOffset, PatchHeight, false);
+		AppendVerticalEndCapWall(OutWalls, PatchFrames.Last(), InnerOffset, OuterOffset, BaseVerticalOffset, PatchHeight, true);
 	}
-	FlushRun();
 }
 
 TArray<float> FFlexRoadMeshBuilder::BuildSampleArcLengths(float TrimStart, float TrimEnd, float SampleStep)
@@ -232,7 +294,7 @@ FFlexCurveFrame FFlexRoadMeshBuilder::SampleFrameAtArcLength(const FFlexBezierCu
 	return Frames.IsValidIndex(BestIndex) ? Frames[BestIndex] : FFlexCurveFrame();
 }
 
-FFlexSegmentMeshResult FFlexRoadMeshBuilder::BuildSegmentMesh(const FFlexBezierCurve& Curve, const FFlexArcLengthTable& ArcLengthTable, const URoadTypeProfile* Profile, const FVector& ReferenceUp, float SampleStep, float TrimStartArcLength, float TrimEndArcLength, float BikeLaneVerticalOffset, float ParkingLaneVerticalOffset)
+FFlexSegmentMeshResult FFlexRoadMeshBuilder::BuildSegmentMesh(const FFlexBezierCurve& Curve, const FFlexArcLengthTable& ArcLengthTable, const URoadTypeProfile* Profile, const FVector& ReferenceUp, float SampleStep, float TrimStartArcLength, float TrimEndArcLength, float BikeLaneVerticalOffset)
 {
 	FFlexSegmentMeshResult Result;
 
@@ -313,7 +375,38 @@ FFlexSegmentMeshResult FFlexRoadMeshBuilder::BuildSegmentMesh(const FFlexBezierC
 	if (Profile->ParkingLaneMaterial)
 	{
 		Result.ParkingLanes.Material = Profile->ParkingLaneMaterial;
-		AppendParkingLaneOverlay(Result.ParkingLanes, Frames, *Profile, ParkingLaneVerticalOffset);
+		AppendParkingLaneOverlay(Result.ParkingLanes, Frames, *Profile, Profile->ParkingLaneHeight);
+	}
+
+	if (Profile->bGenerateParkingLaneCurbs)
+	{
+		Result.ParkingLaneCurbs.Material = Profile->CurbMaterial ? Profile->CurbMaterial : Profile->SidewalkMaterial;
+		AppendParkingLaneCurbs(Result.ParkingLaneCurbs, Frames, *Profile, Profile->ParkingLaneCurbHeight);
+	}
+
+	if (Profile->bGenerateSidewalkTreePatches && Profile->SidewalkWidth > KINDA_SMALL_NUMBER
+		&& Profile->TreePatchWidth > KINDA_SMALL_NUMBER && Profile->TreePatchLength > KINDA_SMALL_NUMBER
+		&& Profile->TreePatchSpacing > KINDA_SMALL_NUMBER)
+	{
+		const float ActualPatchWidth = FMath::Min(Profile->TreePatchWidth, FMath::Max(0.f, Profile->SidewalkWidth - Profile->TreePatchInsetFromRoad));
+		if (ActualPatchWidth > KINDA_SMALL_NUMBER)
+		{
+			Result.SidewalkTreePatches.Material = Profile->MedianMaterial;
+			Result.SidewalkTreePatchCurbs.Material = Profile->CurbMaterial ? Profile->CurbMaterial : Profile->SidewalkMaterial;
+
+			// Left/inner sidewalk sits at [RoadwayMinOffset - SidewalkWidth, RoadwayMinOffset], so its
+			// near (road-side) edge is at RoadwayMinOffset and the patch sits further out (more negative).
+			const float LeftNear = RoadwayMinOffset - Profile->TreePatchInsetFromRoad;
+			const float LeftFar = LeftNear - ActualPatchWidth;
+			AppendSidewalkTreePatches(Result.SidewalkTreePatches, Result.SidewalkTreePatchCurbs, Curve, ArcLengthTable, ReferenceUp,
+				LeftNear, LeftFar, Profile->CurbHeight, Profile->TreePatchHeight, Profile->TreePatchLength, Profile->TreePatchSpacing, TrimStart, TrimEnd);
+
+			// Right/outer sidewalk sits at [RoadwayMaxOffset, RoadwayMaxOffset + SidewalkWidth], mirrored.
+			const float RightNear = RoadwayMaxOffset + Profile->TreePatchInsetFromRoad;
+			const float RightFar = RightNear + ActualPatchWidth;
+			AppendSidewalkTreePatches(Result.SidewalkTreePatches, Result.SidewalkTreePatchCurbs, Curve, ArcLengthTable, ReferenceUp,
+				RightNear, RightFar, Profile->CurbHeight, Profile->TreePatchHeight, Profile->TreePatchLength, Profile->TreePatchSpacing, TrimStart, TrimEnd);
+		}
 	}
 
 	return Result;

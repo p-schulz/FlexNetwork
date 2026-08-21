@@ -212,11 +212,23 @@ void AFlexNetworkMeshActor::ApplyUnifiedNetworkMesh(const FFlexUnifiedNetworkMes
 	{
 		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
 	}
+	for (const FFlexMeshSectionData& Section : MeshResult.ParkingLaneCurbs)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
 	for (const FFlexMeshSectionData& Section : MeshResult.Medians)
 	{
 		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
 	}
 	for (const FFlexMeshSectionData& Section : MeshResult.MedianCurbs)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
+	for (const FFlexMeshSectionData& Section : MeshResult.SidewalkTreePatches)
+	{
+		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
+	}
+	for (const FFlexMeshSectionData& Section : MeshResult.SidewalkTreePatchCurbs)
 	{
 		ApplySectionData(UnifiedNetworkComponent, SectionIndex++, Section);
 	}

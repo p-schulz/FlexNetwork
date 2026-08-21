@@ -14,6 +14,7 @@
 #include "Mesh/FlexMeshSectionData.h"
 #include "FlexNetworkSubsystem.generated.h"
 
+class AActor;
 class AFlexNetworkMeshActor;
 class AFlexNetworkSegmentActor;
 class UFlexNetworkSettings;
@@ -222,12 +223,34 @@ public:
 	/** Same reasoning as BuildBikeLaneMeshResults, for Parking-type lanes and ParkingLaneMaterial instead. */
 	void BuildParkingLaneMeshResults(TArray<FFlexMeshSectionData>& OutResults) const;
 
+	/** Curb walls (see FFlexRoadMeshBuilder::AppendParkingLaneCurbs) around every Parking-type lane run, graph-wide, for every profile with URoadTypeProfile::bGenerateParkingLaneCurbs on. */
+	void BuildParkingLaneCurbMeshResults(TArray<FFlexMeshSectionData>& OutResults) const;
+
+	/**
+	 * Sidewalk tree-patch (tree pit) top and curb-wall geometry graph-wide, for every profile with
+	 * URoadTypeProfile::bGenerateSidewalkTreePatches on. See FFlexRoadMeshBuilder::AppendSidewalkTreePatches.
+	 */
+	void BuildSidewalkTreePatchMeshResults(TArray<FFlexMeshSectionData>& OutTopResults, TArray<FFlexMeshSectionData>& OutWallResults) const;
+
 	/**
 	 * Builds median-lane raised top and curb-wall geometry graph-wide, grouped one section per
 	 * distinct material actually used: OutTopResults uses each profile's MedianMaterial, OutWallResults
 	 * uses CurbMaterial (falling back to SidewalkMaterial) -- see FFlexRoadMeshBuilder::AppendMedianOverlay.
 	 */
 	void BuildMedianMeshResults(TArray<FFlexMeshSectionData>& OutTopResults, TArray<FFlexMeshSectionData>& OutWallResults) const;
+
+	/**
+	 * On-demand actor-spawning pass (see FRoadLaneDescriptor::LaneActors/FFlexLaneActorSpawnEntry):
+	 * destroys every actor a previous call spawned, then walks every non-rail segment's lanes and, for
+	 * each FFlexLaneActorSpawnEntry with a valid ActorClass, spawns one instance every
+	 * SpacingDistance along the segment's trimmed span, positioned LaneEdgeOffset out from the lane's
+	 * own outer edge and oriented along the lane's direction of travel plus HeadingOffsetDegrees
+	 * (both optionally jittered per bUseOffsetAndHeadingVariance). Unlike the mesh-generation passes
+	 * above, this is never called automatically from RebuildDirty() -- call it explicitly (see
+	 * UFlexNetworkEdModeSettings::GenerateLaneActors) whenever the graph or its profiles' lane-actor
+	 * configuration has changed. Returns how many actors were spawned.
+	 */
+	int32 GenerateLaneActors();
 
 	/** Position/tangent/right/up at ArcLength along Segment -- lane positions use Profile.LateralOffset + Lane.LateralOffset. */
 	FFlexCurveFrame SampleSegmentAtArcLength(FFlexSegmentId SegmentId, float ArcLength) const;
@@ -295,6 +318,10 @@ private:
 	UPROPERTY(Transient)
 	TMap<FFlexSegmentId, TObjectPtr<AFlexNetworkSegmentActor>> SegmentActors;
 
+	/** Actors spawned by the most recent GenerateLaneActors() call, destroyed wholesale at the start of the next one. */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<AActor>> SpawnedLaneActors;
+
 	EFlexNetworkVisualizationMode VisualizationMode = EFlexNetworkVisualizationMode::GeneratedGeometry;
 	/** Segment actor currently responsible for the single profile-wide PCG rail result. */
 	FFlexSegmentId RailPCGOwner = FFlexSegmentId::Invalid();
@@ -336,6 +363,17 @@ private:
 	/** Same reuse strategy as CachedBikeLaneSections, for Parking-type lane overlay geometry. */
 	UPROPERTY(Transient)
 	TArray<FFlexMeshSectionData> CachedParkingLaneSections;
+
+	/** Same reuse strategy as CachedBikeLaneSections, for parking-lane curb wall geometry. */
+	UPROPERTY(Transient)
+	TArray<FFlexMeshSectionData> CachedParkingLaneCurbSections;
+
+	/** Same reuse strategy as CachedBikeLaneSections, for sidewalk tree-patch top/wall geometry. */
+	UPROPERTY(Transient)
+	TArray<FFlexMeshSectionData> CachedTreePatchTopSections;
+
+	UPROPERTY(Transient)
+	TArray<FFlexMeshSectionData> CachedTreePatchWallSections;
 
 	/** Same reuse strategy as CachedBikeLaneSections, for median top/wall geometry. */
 	UPROPERTY(Transient)

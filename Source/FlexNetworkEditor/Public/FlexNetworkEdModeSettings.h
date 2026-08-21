@@ -7,6 +7,7 @@
 #include "FlexNetworkEdModeSettings.generated.h"
 
 class URoadTypeProfile;
+class UFlexSyntheticNetworkConfig;
 class UOsmDataAsset;
 class UMaterialInterface;
 class UStaticMesh;
@@ -93,6 +94,42 @@ public:
 	/** Imports only configured railway ways and builds matching train/tram FlexNetwork segments and generated rail profiles. */
 	UFUNCTION(CallInEditor, Category = "OSM Import|Railways", meta = (DisplayName = "Generate Rails From OSM"))
 	void GenerateRailsFromOsm();
+
+	/** Road type used for major (arterial) generated streamlines. Required to generate a synthetic network. */
+	UPROPERTY(EditAnywhere, Category = "Synthetic Network")
+	TObjectPtr<URoadTypeProfile> SyntheticArterialProfile;
+
+	/** Road type used for minor (local) generated streamlines. Required to generate a synthetic network. */
+	UPROPERTY(EditAnywhere, Category = "Synthetic Network")
+	TObjectPtr<URoadTypeProfile> SyntheticLocalProfile;
+
+	/** Author-able tensor-field regions (grid districts, radial centers, blended together) -- see UFlexSyntheticNetworkConfig. Leave unset to use the built-in default two-region field. */
+	UPROPERTY(EditAnywhere, Category = "Synthetic Network")
+	TObjectPtr<UFlexSyntheticNetworkConfig> SyntheticNetworkConfig;
+
+	/** Half-width/half-height (cm) of the square domain generated around the world origin. */
+	UPROPERTY(EditAnywhere, Category = "Synthetic Network", meta = (ClampMin = "1000.0", Units = "cm"))
+	float SyntheticDomainHalfSize = 10000.f;
+
+	/** Higher values seed more major streamlines and space minor (cross-street) streamlines closer together, producing smaller blocks. */
+	UPROPERTY(EditAnywhere, Category = "Synthetic Network", meta = (ClampMin = "1", ClampMax = "10"))
+	int32 SyntheticBlockDensity = 4;
+
+	/** A streamline stops early if it gets this close (cm) to a different, already-traced streamline -- raise this if generated roads still read as overlapping/crowded (e.g. near a radial field's center), lower it to allow denser networks. */
+	UPROPERTY(EditAnywhere, Category = "Synthetic Network", meta = (ClampMin = "0.0", Units = "cm"))
+	float SyntheticMinStreamlineSeparation = 600.f;
+
+	/**
+	 * Generates a synthetic road network (see the plugin's synthetic-generation plan document) from
+	 * either the assigned Synthetic Network Config's authored field regions, or (if unset) the same
+	 * built-in default two-region field Phase 1 used, and adds it directly to the current FlexNetwork
+	 * graph via the same AddNode/AddSegment API a hand-drawn or OSM-imported network uses.
+	 */
+	UFUNCTION(CallInEditor, Category = "Synthetic Network", meta = (DisplayName = "Generate Synthetic Network"))
+	void GenerateSyntheticNetwork();
+
+	UPROPERTY(VisibleAnywhere, Category = "Synthetic Network", meta = (MultiLine = true))
+	FString SyntheticNetworkStatus = TEXT("No synthetic network has been generated in this editor session.");
 
 	/** Rebuilds every road, sidewalk, junction and segment visualization from authoritative graph data. */
 	UFUNCTION(CallInEditor, Category = "FlexNetwork", meta = (DisplayName = "Rebuild All Network Geometry"))
@@ -231,6 +268,13 @@ public:
 	/** Replaces every previously-generated curbstone with a fresh set spline-fit along the current road/junction curb lines using CurbstoneMesh. */
 	UFUNCTION(CallInEditor, Category = "Curbstones", meta = (DisplayName = "Generate Curbstones"))
 	void GenerateCurbstones();
+
+	/** Destroys every actor a previous call spawned, then re-spawns one instance of each FRoadLaneDescriptor::LaneActors entry along every matching lane, graph-wide. See UFlexNetworkSubsystem::GenerateLaneActors. */
+	UFUNCTION(CallInEditor, Category = "Lane Actors", meta = (DisplayName = "Generate Lane Actors"))
+	void GenerateLaneActors();
+
+	UPROPERTY(VisibleAnywhere, Category = "Lane Actors", meta = (MultiLine = true))
+	FString LaneActorGenerationStatus = TEXT("No lane actors have been generated in this editor session.");
 
 	/**
 	 * Fetches LGL-BW aerial (and, if UFlexSatelliteImagerySettings::bFetchLandUseOverlay is on,

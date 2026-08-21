@@ -156,6 +156,18 @@ struct FLEXNETWORKRUNTIME_API FFlexSegmentMeshResult
 	UPROPERTY()
 	FFlexMeshSectionData ParkingLanes;
 
+	/** Curb wall(s) along both long edges of every Parking-type lane run -- empty unless Profile::bGenerateParkingLaneCurbs is on. */
+	UPROPERTY()
+	FFlexMeshSectionData ParkingLaneCurbs;
+
+	/** Sidewalk tree-patch raised top(s) -- empty unless Profile::bGenerateSidewalkTreePatches is on. See FFlexRoadMeshBuilder::AppendSidewalkTreePatches. */
+	UPROPERTY()
+	FFlexMeshSectionData SidewalkTreePatches;
+
+	/** Sidewalk tree-patch curb wall(s), all four sides of every patch. */
+	UPROPERTY()
+	FFlexMeshSectionData SidewalkTreePatchCurbs;
+
 	/** Arc length (cm), measured from the segment's start (t=0), at which the road/sidewalk strips begin -- 0 unless trimmed by a junction at the start node. */
 	float TrimStartArcLength = 0.f;
 
@@ -224,6 +236,18 @@ struct FLEXNETWORKRUNTIME_API FFlexUnifiedNetworkMeshResult
 	/** Parking-lane overlay strips, one section per distinct ParkingLaneMaterial encountered, raised slightly above the roadway they sit on. */
 	UPROPERTY()
 	TArray<FFlexMeshSectionData> ParkingLanes;
+
+	/** Parking-lane curb wall strips, one section per distinct CurbMaterial (falling back to SidewalkMaterial) encountered. See UFlexNetworkSubsystem::BuildParkingLaneCurbMeshResults. */
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> ParkingLaneCurbs;
+
+	/** Sidewalk tree-patch raised top strips, one section per distinct MedianMaterial encountered. See UFlexNetworkSubsystem::BuildSidewalkTreePatchMeshResults. */
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> SidewalkTreePatches;
+
+	/** Sidewalk tree-patch curb wall strips, one section per distinct CurbMaterial (falling back to SidewalkMaterial) encountered. */
+	UPROPERTY()
+	TArray<FFlexMeshSectionData> SidewalkTreePatchCurbs;
 
 	/** Exposed unified curb-edge chords for the editor's optional static curbstone pass. */
 	TArray<TArray<FVector>> CurbLines;

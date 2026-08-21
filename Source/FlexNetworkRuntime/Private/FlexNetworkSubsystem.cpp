@@ -1533,8 +1533,9 @@ bool UFlexNetworkSubsystem::BuildSegmentMeshResult(FFlexSegmentId SegmentId, FFl
 	const FFlexRoadNode* StartNode = Nodes.Find(Segment->StartNodeId);
 	OutResult = FFlexRoadMeshBuilder::BuildSegmentMesh(Segment->Curve, Segment->ArcLengthTable,
 		Segment->Profile, StartNode ? StartNode->UpVector : FVector::UpVector,
-		GetSettings()->ArcLengthSampleStep, TrimStart, TrimEnd, GetSettings()->BikeLaneVerticalOffset, GetSettings()->ParkingLaneVerticalOffset);
-	return !OutResult.Roadway.IsEmpty() || !OutResult.Sidewalks.IsEmpty() || !OutResult.BikeLanes.IsEmpty() || !OutResult.Median.IsEmpty() || !OutResult.ParkingLanes.IsEmpty();
+		GetSettings()->ArcLengthSampleStep, TrimStart, TrimEnd, GetSettings()->BikeLaneVerticalOffset);
+	return !OutResult.Roadway.IsEmpty() || !OutResult.Sidewalks.IsEmpty() || !OutResult.BikeLanes.IsEmpty() || !OutResult.Median.IsEmpty()
+		|| !OutResult.ParkingLanes.IsEmpty() || !OutResult.ParkingLaneCurbs.IsEmpty() || !OutResult.SidewalkTreePatches.IsEmpty();
 }
 
 bool UFlexNetworkSubsystem::GetSegmentTrimRange(FFlexSegmentId SegmentId, float& OutTrimStart, float& OutTrimEnd) const
@@ -2108,7 +2109,7 @@ void UFlexNetworkSubsystem::BuildParkingLaneMeshResults(TArray<FFlexMeshSectionD
 		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
 		const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(
 			Segment.Curve, Segment.ArcLengthTable, ReferenceUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
-		FFlexRoadMeshBuilder::AppendParkingLaneOverlay(*Section, Frames, *Segment.Profile, Settings->ParkingLaneVerticalOffset);
+		FFlexRoadMeshBuilder::AppendParkingLaneOverlay(*Section, Frames, *Segment.Profile, Segment.Profile->ParkingLaneHeight);
 	}
 
 	for (TPair<UMaterialInterface*, FFlexMeshSectionData>& Entry : ParkingLaneByMaterial)
@@ -2116,6 +2117,155 @@ void UFlexNetworkSubsystem::BuildParkingLaneMeshResults(TArray<FFlexMeshSectionD
 		if (!Entry.Value.IsEmpty())
 		{
 			OutResults.Add(MoveTemp(Entry.Value));
+		}
+	}
+}
+
+void UFlexNetworkSubsystem::BuildParkingLaneCurbMeshResults(TArray<FFlexMeshSectionData>& OutResults) const
+{
+	OutResults.Reset();
+	const UFlexNetworkSettings* Settings = GetSettings();
+
+	TMap<UMaterialInterface*, FFlexMeshSectionData> WallByMaterial;
+
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || Segment.Profile->bIsRailProfile || !Segment.Profile->bGenerateParkingLaneCurbs || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		if (IsInternalComplexIntersectionSegment(Segment))
+		{
+			continue;
+		}
+
+		UMaterialInterface* WallMaterial = Segment.Profile->CurbMaterial ? Segment.Profile->CurbMaterial.Get() : Segment.Profile->SidewalkMaterial.Get();
+		if (!WallMaterial)
+		{
+			continue;
+		}
+
+		float TrimStart = 0.f;
+		float TrimEnd = Segment.GetLength();
+		if (!GetSegmentTrimRange(Pair.Key, TrimStart, TrimEnd))
+		{
+			continue;
+		}
+		if (TrimEnd - TrimStart <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		FFlexMeshSectionData* WallSection = WallByMaterial.Find(WallMaterial);
+		if (!WallSection)
+		{
+			WallSection = &WallByMaterial.Add(WallMaterial);
+			WallSection->Material = WallMaterial;
+		}
+
+		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
+		const TArray<FFlexCurveFrame> Frames = FFlexRoadMeshBuilder::BuildFramesForRange(
+			Segment.Curve, Segment.ArcLengthTable, ReferenceUp, Settings->ArcLengthSampleStep, TrimStart, TrimEnd);
+		FFlexRoadMeshBuilder::AppendParkingLaneCurbs(*WallSection, Frames, *Segment.Profile, Segment.Profile->ParkingLaneCurbHeight);
+	}
+
+	for (TPair<UMaterialInterface*, FFlexMeshSectionData>& Entry : WallByMaterial)
+	{
+		if (!Entry.Value.IsEmpty())
+		{
+			OutResults.Add(MoveTemp(Entry.Value));
+		}
+	}
+}
+
+void UFlexNetworkSubsystem::BuildSidewalkTreePatchMeshResults(TArray<FFlexMeshSectionData>& OutTopResults, TArray<FFlexMeshSectionData>& OutWallResults) const
+{
+	OutTopResults.Reset();
+	OutWallResults.Reset();
+
+	TMap<UMaterialInterface*, FFlexMeshSectionData> TopByMaterial;
+	TMap<UMaterialInterface*, FFlexMeshSectionData> WallByMaterial;
+
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || Segment.Profile->bIsRailProfile || !Segment.Profile->bGenerateSidewalkTreePatches || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		if (Segment.Profile->SidewalkWidth <= KINDA_SMALL_NUMBER || Segment.Profile->TreePatchWidth <= KINDA_SMALL_NUMBER
+			|| Segment.Profile->TreePatchLength <= KINDA_SMALL_NUMBER || Segment.Profile->TreePatchSpacing <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+		const float ActualPatchWidth = FMath::Min(Segment.Profile->TreePatchWidth, FMath::Max(0.f, Segment.Profile->SidewalkWidth - Segment.Profile->TreePatchInsetFromRoad));
+		if (ActualPatchWidth <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+		if (IsInternalComplexIntersectionSegment(Segment))
+		{
+			continue;
+		}
+
+		UMaterialInterface* WallMaterial = Segment.Profile->CurbMaterial ? Segment.Profile->CurbMaterial.Get() : Segment.Profile->SidewalkMaterial.Get();
+		if (!Segment.Profile->MedianMaterial && !WallMaterial)
+		{
+			continue;
+		}
+
+		float TrimStart = 0.f;
+		float TrimEnd = Segment.GetLength();
+		if (!GetSegmentTrimRange(Pair.Key, TrimStart, TrimEnd))
+		{
+			continue;
+		}
+		if (TrimEnd - TrimStart <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		FFlexMeshSectionData* TopSection = TopByMaterial.Find(Segment.Profile->MedianMaterial.Get());
+		if (!TopSection)
+		{
+			TopSection = &TopByMaterial.Add(Segment.Profile->MedianMaterial.Get());
+			TopSection->Material = Segment.Profile->MedianMaterial;
+		}
+		FFlexMeshSectionData* WallSection = WallByMaterial.Find(WallMaterial);
+		if (!WallSection)
+		{
+			WallSection = &WallByMaterial.Add(WallMaterial);
+			WallSection->Material = WallMaterial;
+		}
+
+		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
+		const float RoadwayMinOffset = Segment.Profile->GetRoadwayMinOffset();
+		const float RoadwayMaxOffset = Segment.Profile->GetRoadwayMaxOffset();
+
+		const float LeftNear = RoadwayMinOffset - Segment.Profile->TreePatchInsetFromRoad;
+		const float LeftFar = LeftNear - ActualPatchWidth;
+		FFlexRoadMeshBuilder::AppendSidewalkTreePatches(*TopSection, *WallSection, Segment.Curve, Segment.ArcLengthTable, ReferenceUp,
+			LeftNear, LeftFar, Segment.Profile->CurbHeight, Segment.Profile->TreePatchHeight, Segment.Profile->TreePatchLength, Segment.Profile->TreePatchSpacing, TrimStart, TrimEnd);
+
+		const float RightNear = RoadwayMaxOffset + Segment.Profile->TreePatchInsetFromRoad;
+		const float RightFar = RightNear + ActualPatchWidth;
+		FFlexRoadMeshBuilder::AppendSidewalkTreePatches(*TopSection, *WallSection, Segment.Curve, Segment.ArcLengthTable, ReferenceUp,
+			RightNear, RightFar, Segment.Profile->CurbHeight, Segment.Profile->TreePatchHeight, Segment.Profile->TreePatchLength, Segment.Profile->TreePatchSpacing, TrimStart, TrimEnd);
+	}
+
+	for (TPair<UMaterialInterface*, FFlexMeshSectionData>& Entry : TopByMaterial)
+	{
+		if (!Entry.Value.IsEmpty())
+		{
+			OutTopResults.Add(MoveTemp(Entry.Value));
+		}
+	}
+	for (TPair<UMaterialInterface*, FFlexMeshSectionData>& Entry : WallByMaterial)
+	{
+		if (!Entry.Value.IsEmpty())
+		{
+			OutWallResults.Add(MoveTemp(Entry.Value));
 		}
 	}
 }
@@ -2646,6 +2796,13 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 
 	if (bMarkingRelevant)
 	{
+		CachedParkingLaneCurbSections.Reset();
+		BuildParkingLaneCurbMeshResults(CachedParkingLaneCurbSections);
+	}
+	Result.ParkingLaneCurbs = CachedParkingLaneCurbSections;
+
+	if (bMarkingRelevant)
+	{
 		CachedMedianTopSections.Reset();
 		CachedMedianWallSections.Reset();
 		BuildMedianMeshResults(CachedMedianTopSections, CachedMedianWallSections);
@@ -2653,7 +2810,114 @@ FFlexUnifiedNetworkMeshResult UFlexNetworkSubsystem::BuildUnifiedClassicMeshResu
 	Result.Medians = CachedMedianTopSections;
 	Result.MedianCurbs = CachedMedianWallSections;
 
+	if (bMarkingRelevant)
+	{
+		CachedTreePatchTopSections.Reset();
+		CachedTreePatchWallSections.Reset();
+		BuildSidewalkTreePatchMeshResults(CachedTreePatchTopSections, CachedTreePatchWallSections);
+	}
+	Result.SidewalkTreePatches = CachedTreePatchTopSections;
+	Result.SidewalkTreePatchCurbs = CachedTreePatchWallSections;
+
 	return Result;
+}
+
+int32 UFlexNetworkSubsystem::GenerateLaneActors()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return 0;
+	}
+
+	for (const TObjectPtr<AActor>& SpawnedActor : SpawnedLaneActors)
+	{
+		if (SpawnedActor)
+		{
+			SpawnedActor->Destroy();
+		}
+	}
+	SpawnedLaneActors.Reset();
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	for (const TPair<FFlexSegmentId, FFlexRoadSegment>& Pair : Segments)
+	{
+		const FFlexSegmentId SegmentId = Pair.Key;
+		const FFlexRoadSegment& Segment = Pair.Value;
+		if (!Segment.Profile || Segment.Profile->bIsRailProfile || !Segment.ArcLengthTable.IsValid())
+		{
+			continue;
+		}
+		if (IsInternalComplexIntersectionSegment(Segment))
+		{
+			continue;
+		}
+
+		bool bAnySpawnEntries = false;
+		for (const FRoadLaneDescriptor& Lane : Segment.Profile->Lanes)
+		{
+			if (!Lane.LaneActors.IsEmpty())
+			{
+				bAnySpawnEntries = true;
+				break;
+			}
+		}
+		if (!bAnySpawnEntries)
+		{
+			continue;
+		}
+
+		float TrimStart = 0.f;
+		float TrimEnd = Segment.GetLength();
+		if (!GetSegmentTrimRange(SegmentId, TrimStart, TrimEnd) || TrimEnd - TrimStart <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		const FVector ReferenceUp = Nodes.Contains(Segment.StartNodeId) ? Nodes.FindChecked(Segment.StartNodeId).UpVector : FVector::UpVector;
+
+		for (const FRoadLaneDescriptor& Lane : Segment.Profile->Lanes)
+		{
+			// Right = CrossProduct(Up, Tangent) is the codebase-wide convention -- the lane's own
+			// outer edge is its +Right boundary, LaneEdgeOffset measured further out from there.
+			const float LaneOuterOffset = Segment.Profile->GetLaneLateralOffset(Lane) + Lane.Width * 0.5f;
+			// Backward reverses the base heading to match the lane's own direction of travel;
+			// Bidirectional/None fall back to the raw curve tangent.
+			const float TangentSign = Lane.Direction == EFlexLaneDirection::Backward ? -1.f : 1.f;
+
+			for (const FFlexLaneActorSpawnEntry& SpawnEntry : Lane.LaneActors)
+			{
+				if (!SpawnEntry.ActorClass || SpawnEntry.SpacingDistance <= KINDA_SMALL_NUMBER)
+				{
+					continue;
+				}
+
+				const float PlacementOffset = LaneOuterOffset + SpawnEntry.LaneEdgeOffset;
+
+				for (float ArcLength = TrimStart + SpawnEntry.SpacingDistance * 0.5f; ArcLength < TrimEnd; ArcLength += SpawnEntry.SpacingDistance)
+				{
+					const FFlexCurveFrame Frame = FFlexRoadMeshBuilder::SampleFrameAtArcLength(Segment.Curve, Segment.ArcLengthTable, ArcLength, ReferenceUp);
+
+					const float OffsetJitter = SpawnEntry.bUseOffsetAndHeadingVariance ? FMath::FRandRange(-SpawnEntry.OffsetVarianceRange, SpawnEntry.OffsetVarianceRange) : 0.f;
+					const float HeadingJitter = SpawnEntry.bUseOffsetAndHeadingVariance ? FMath::FRandRange(-SpawnEntry.HeadingVarianceRangeDegrees, SpawnEntry.HeadingVarianceRangeDegrees) : 0.f;
+
+					const FVector SpawnLocation = Frame.Position + Frame.Right * (PlacementOffset + OffsetJitter);
+					const FVector HeadingDirection = (Frame.Tangent * TangentSign).GetSafeNormal();
+					const FRotator BaseRotation = FRotationMatrix::MakeFromXZ(HeadingDirection, Frame.Up).Rotator();
+					const FRotator SpawnRotation = BaseRotation + FRotator(0.f, SpawnEntry.HeadingOffsetDegrees + HeadingJitter, 0.f);
+
+					if (AActor* SpawnedActor = World->SpawnActor<AActor>(SpawnEntry.ActorClass, SpawnLocation, SpawnRotation, SpawnParams))
+					{
+						SpawnedLaneActors.Add(SpawnedActor);
+					}
+				}
+			}
+		}
+	}
+
+	return SpawnedLaneActors.Num();
 }
 
 FFlexCurveFrame UFlexNetworkSubsystem::SampleSegmentAtArcLength(FFlexSegmentId SegmentId, float ArcLength) const

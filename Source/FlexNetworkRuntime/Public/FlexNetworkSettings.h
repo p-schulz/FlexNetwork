@@ -111,10 +111,6 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category = "Mesh", meta = (ClampMin = "0.0", Units = "cm"))
 	float BikeLaneVerticalOffset = 0.3f;
 
-	/** Vertical offset (cm) baked into a Parking-lane overlay's own vertices, above the ordinary roadway surface it sits on -- same reasoning as BikeLaneVerticalOffset. */
-	UPROPERTY(EditAnywhere, Config, Category = "Mesh", meta = (ClampMin = "0.0", Units = "cm"))
-	float ParkingLaneVerticalOffset = 0.3f;
-
 	/**
 	 * Optional actor subclass spawned for every segment. A Blueprint subclass can preconfigure the
 	 * built-in PCG component with a graph; null uses the native visualization actor.

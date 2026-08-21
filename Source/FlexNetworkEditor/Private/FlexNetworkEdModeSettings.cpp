@@ -2,6 +2,7 @@
 #include "Osm/OsmDataAsset.h"
 #include "Osm/FlexOsmGraphBuilder.h"
 #include "Osm/FlexOsmImportContextActor.h"
+#include "Synthetic/FlexSyntheticGraphBuilder.h"
 #include "FlexNetworkSubsystem.h"
 #include "FlexNetworkAssetUtils.h"
 #include "FlexNetworkMeshActor.h"
@@ -215,6 +216,75 @@ void UFlexNetworkEdModeSettings::GenerateTransportFromOsm(const bool bIncludeRoa
 		ImportKind,
 		Result.NumWaysImported, Result.NumRailwayWaysImported, Result.NumSegmentsCreated, Result.NumNodesCreated, Result.NumTrafficControlsImported, Result.NumJunctionsMerged,
 		Result.NumComplexIntersectionsCollapsed, Result.NumDistinctLaneSignatures);
+}
+
+void UFlexNetworkEdModeSettings::GenerateSyntheticNetwork()
+{
+	UWorld* World = TargetWorld.Get();
+	if (!World)
+	{
+		SyntheticNetworkStatus = TEXT("No world available to generate a synthetic network in.");
+		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: %s"), *SyntheticNetworkStatus);
+		return;
+	}
+	UFlexNetworkSubsystem* Subsystem = World->GetSubsystem<UFlexNetworkSubsystem>();
+	if (!Subsystem)
+	{
+		SyntheticNetworkStatus = TEXT("UFlexNetworkSubsystem not available on this world.");
+		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: %s"), *SyntheticNetworkStatus);
+		return;
+	}
+	if (!SyntheticArterialProfile || !SyntheticLocalProfile)
+	{
+		SyntheticNetworkStatus = TEXT("Set both Synthetic Arterial Profile and Synthetic Local Profile before generating.");
+		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: %s"), *SyntheticNetworkStatus);
+		return;
+	}
+
+	FFlexSyntheticGenerationSettings Settings;
+	Settings.DomainMin = FVector2d(-SyntheticDomainHalfSize, -SyntheticDomainHalfSize);
+	Settings.DomainMax = FVector2d(SyntheticDomainHalfSize, SyntheticDomainHalfSize);
+	Settings.NumMajorSeeds = SyntheticBlockDensity;
+	Settings.MinorSeedSpacing = FMath::Max(500.0, 6000.0 / SyntheticBlockDensity);
+	Settings.MinStreamlineSeparation = SyntheticMinStreamlineSeparation;
+
+	// Authored field regions if a config asset is assigned; otherwise fall back to the same
+	// built-in two-region field Phase 1 used, scaled to the configured domain.
+	if (SyntheticNetworkConfig && !SyntheticNetworkConfig->FieldRegions.IsEmpty())
+	{
+		Settings.FieldRegions = SyntheticNetworkConfig->FieldRegions;
+	}
+	else
+	{
+		Settings.FieldRegions = FlexSyntheticGraphBuilder::MakeDefaultFieldRegions(SyntheticDomainHalfSize);
+	}
+
+	FScopedTransaction Transaction(NSLOCTEXT("FlexNetwork", "GenerateSyntheticNetwork", "Generate Synthetic Network"));
+	Subsystem->BeginBatchUpdate();
+	ON_SCOPE_EXIT
+	{
+		Subsystem->EndBatchUpdate();
+	};
+	Subsystem->SetVisualizationMode(VisualizationMode);
+
+	const FFlexSyntheticGenerationResult Result = FlexSyntheticGraphBuilder::GenerateSyntheticNetwork(
+		*Subsystem, Settings,
+		[this](EFlexSyntheticRoadTier Tier) -> URoadTypeProfile*
+		{
+			return Tier == EFlexSyntheticRoadTier::Arterial ? SyntheticArterialProfile.Get() : SyntheticLocalProfile.Get();
+		});
+
+	if (Result.bHasSelfIntersectionsAfterPlanarization)
+	{
+		SyntheticNetworkStatus = TEXT("Generation aborted: planarization reported self-intersections (see log).");
+	}
+	else
+	{
+		SyntheticNetworkStatus = FString::Printf(TEXT("Generated %d node(s), %d segment(s) from %d streamline(s) in %.3f s.%s"),
+			Result.NumNodesCreated, Result.NumSegmentsCreated, Result.NumStreamlinesTraced, Result.GenerationSeconds,
+			Result.bSegmentBudgetExceeded ? TEXT(" (segment budget exceeded -- result is incomplete)") : TEXT(""));
+	}
+	UE_LOG(LogTemp, Display, TEXT("FlexNetwork: %s"), *SyntheticNetworkStatus);
 }
 
 void UFlexNetworkEdModeSettings::RebuildAllNetworkGeometry()
@@ -512,6 +582,29 @@ void UFlexNetworkEdModeSettings::GenerateCurbstones()
 	const TArray<TArray<FVector>>& CurbLines = MeshActor->GetUnifiedCurbLines();
 	MeshActor->ApplyCurbstones(CurbLines, CurbstoneMesh);
 	UE_LOG(LogTemp, Display, TEXT("FlexNetwork: generated curbstones along %d curb line(s)."), CurbLines.Num());
+}
+
+void UFlexNetworkEdModeSettings::GenerateLaneActors()
+{
+	UWorld* World = TargetWorld.Get();
+	if (!World)
+	{
+		LaneActorGenerationStatus = TEXT("No world available to generate lane actors in.");
+		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: no world available to generate lane actors in."));
+		return;
+	}
+
+	UFlexNetworkSubsystem* Subsystem = World->GetSubsystem<UFlexNetworkSubsystem>();
+	if (!Subsystem)
+	{
+		LaneActorGenerationStatus = TEXT("UFlexNetworkSubsystem not available on this world.");
+		UE_LOG(LogTemp, Warning, TEXT("FlexNetwork: UFlexNetworkSubsystem not available on this world."));
+		return;
+	}
+
+	const int32 NumSpawned = Subsystem->GenerateLaneActors();
+	LaneActorGenerationStatus = FString::Printf(TEXT("Spawned %d lane actor(s)."), NumSpawned);
+	UE_LOG(LogTemp, Display, TEXT("FlexNetwork: %s"), *LaneActorGenerationStatus);
 }
 
 void UFlexNetworkEdModeSettings::ImportSatelliteImagery()
